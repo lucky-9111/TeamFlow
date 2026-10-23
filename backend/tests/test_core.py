@@ -1,14 +1,14 @@
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 
 from app.cli import main as cli_main
 from app.core.permissions import Action, can
 from app.core.security import hash_password, verify_password
 from app.models import AuthSession, User, Workspace
-from app.models.enums import ProjectRole, WorkspaceRole
+from app.models.enums import WorkspaceRole
 
 
 def test_sqlite_foreign_keys_are_enforced(db):
@@ -70,26 +70,29 @@ class TestPermissionMatrix:
         assert all(can(admin, action) for action in Action)
 
     def test_non_members_have_no_project_access(self):
-        assert not can(self._user(), Action.PROJECT_VIEW, None)
+        assert not can(self._user(), Action.PROJECT_VIEW)
+        assert not can(self._user(), Action.TASK_CREATE)
 
     def test_workspace_actions_are_admin_only(self):
-        for role in ProjectRole:
-            assert not can(self._user(), Action.USER_MANAGE, role)
-            assert not can(self._user(), Action.PROJECT_CREATE, role)
+        for action in (Action.USER_MANAGE, Action.PROJECT_CREATE, Action.PROJECT_MEMBERS_MANAGE):
+            assert not can(self._user(), action, is_project_member=True)
 
-    def test_manager_manages_sprints_but_developer_does_not(self):
-        assert can(self._user(), Action.SPRINT_MANAGE, ProjectRole.MANAGER)
-        assert not can(self._user(), Action.SPRINT_MANAGE, ProjectRole.DEVELOPER)
+    def test_members_create_and_comment_in_their_projects(self):
+        member = self._user()
+        assert can(member, Action.TASK_CREATE, is_project_member=True)
+        assert can(member, Action.TASK_COMMENT, is_project_member=True)
 
-    def test_testers_review_and_create_bugs(self):
-        tester = self._user()
-        assert can(tester, Action.ISSUE_REVIEW, ProjectRole.TESTER)
-        assert can(tester, Action.ISSUE_CREATE_BUG, ProjectRole.TESTER)
-        assert not can(tester, Action.ISSUE_CREATE_PLANNING, ProjectRole.TESTER)
+    def test_task_edit_needs_assignee_or_creator(self):
+        member = self._user()
+        assert not can(member, Action.TASK_EDIT, is_project_member=True)
+        assert can(member, Action.TASK_EDIT, is_project_member=True, is_assignee=True)
+        assert can(member, Action.TASK_EDIT, is_project_member=True, is_creator=True)
+        assert not can(member, Action.TASK_EDIT, is_assignee=True)
 
-    def test_designer_cannot_create_bugs(self):
-        assert not can(self._user(), Action.ISSUE_CREATE_BUG, ProjectRole.DESIGNER)
-        assert can(self._user(), Action.ISSUE_COMMENT, ProjectRole.DESIGNER)
+    def test_only_creator_deletes(self):
+        member = self._user()
+        assert not can(member, Action.TASK_DELETE, is_project_member=True, is_assignee=True)
+        assert can(member, Action.TASK_DELETE, is_project_member=True, is_creator=True)
 
     def test_inactive_users_have_no_permissions(self):
         assert not can(self._user(WorkspaceRole.ADMIN, active=False), Action.PROJECT_VIEW)
@@ -115,3 +118,24 @@ def test_create_admin_cli_enforces_password_policy(monkeypatch):
     monkeypatch.setenv("TEAMFLOW_ADMIN_PASSWORD", "short")
     with pytest.raises(SystemExit, match="Password must be"):
         cli_main(["create-admin", "--email", "a@example.com", "--username", "admin", "--full-name", "A"])
+
+
+def test_seed_dev_is_idempotent_and_blocked_in_production(db, monkeypatch):
+    from app.core.config import get_settings
+    from app.models import Project, Task
+
+    with pytest.raises(SystemExit, match="Create the admin first"):
+        cli_main(["seed-dev"])
+
+    monkeypatch.setenv("TEAMFLOW_ADMIN_PASSWORD", "admin-password-123")
+    cli_main(["create-admin", "--email", "a@example.com", "--username", "admin", "--full-name", "A"])
+    cli_main(["seed-dev"])
+    cli_main(["seed-dev"])
+    assert db.scalar(select(func.count()).select_from(Project)) == 2
+    assert db.scalar(select(func.count()).select_from(Task)) == 7
+    assert db.scalar(select(func.count()).select_from(User)) == 4
+    db.rollback()
+
+    monkeypatch.setattr(get_settings(), "env", "production")
+    with pytest.raises(SystemExit, match="disabled"):
+        cli_main(["seed-dev"])

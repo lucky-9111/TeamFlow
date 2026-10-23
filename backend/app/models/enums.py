@@ -8,11 +8,38 @@ class WorkspaceRole(StrEnum):
     MEMBER = "member"
 
 
-class ProjectRole(StrEnum):
-    MANAGER = "manager"
-    DEVELOPER = "developer"
-    TESTER = "tester"
-    DESIGNER = "designer"
+class ProjectStatus(StrEnum):
+    ACTIVE = "active"
+    ON_HOLD = "on_hold"
+    COMPLETED = "completed"
+
+
+class TaskStatus(StrEnum):
+    TODO = "todo"
+    IN_PROGRESS = "in_progress"
+    IN_REVIEW = "in_review"
+    DONE = "done"
+
+
+class TaskPriority(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    URGENT = "urgent"
+
+
+class TaskType(StrEnum):
+    TASK = "task"
+    BUG = "bug"
+    STORY = "story"
+
+
+STATUS_LABELS = {
+    TaskStatus.TODO: "To Do",
+    TaskStatus.IN_PROGRESS: "In Progress",
+    TaskStatus.IN_REVIEW: "In Review",
+    TaskStatus.DONE: "Done",
+}
 
 
 def str_enum(enum_cls: type[StrEnum], name: str) -> SAEnum:
