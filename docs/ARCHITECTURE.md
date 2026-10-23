@@ -4,6 +4,28 @@ Internal, single-workspace project management tool (Jira-inspired) for a ~10 per
 This document is the Phase 1 deliverable and the reference for later phases. Update it when a
 decision changes.
 
+## 0. Implementation status (updated 2026-10-22)
+
+Built and tested: auth, team management, workspace settings, projects + members + archive, tasks
+(keys like `TF-12`), workflow transitions, comments, activity history, in-app notifications,
+dashboard, search, and the React frontend (Overview, My Tasks/task list, Projects, Board with
+drag-and-drop, Task detail, Team, Activity, Settings). See [API.md](API.md) for the endpoints that exist.
+
+Deliberate differences from the original plan below, to keep v1 small for a 2–10 person team:
+
+| Plan | What was built | Why |
+|------|----------------|-----|
+| "Issues" with Epic/Story/Task/Bug/Subtask, hierarchy, links, labels | "Tasks" with type Task / Story / Bug, no hierarchy, links or labels | The product brief asks for simple tasks; hierarchy can be added later without breaking keys |
+| Sprints, backlog ranking, story points, work logs, burndown reports | Not built | Out of scope for v1; the board + list + dashboard cover daily use |
+| Attachments | Not built | Not in the v1 brief; `TEAMFLOW_UPLOAD_DIR` is reserved for it |
+| Only managers create Epic/Story/Task; developers create bugs | Every project member can create tasks; a per-project switch (`members_can_create_tasks`) limits it to managers | Matches "create tasks if permitted by the project" |
+| `issue_history` + `audit_events` tables | One `activity_events` table (project and/or task scoped; team events have no project) | One feed, one query |
+| Board columns from sprints | Board shows every task of the project (max 500), filterable | No sprints in v1 |
+| Deadline reminder CLI, mentions | Not built | Notifications cover assignment, status changes, comments and being added to a project |
+
+Next candidates if the team needs them: attachments, @mentions, deadline reminders, sprints,
+deployment files (Nginx/systemd, backups), CI workflow.
+
 ## 1. Environment (inspected 2026-10-20)
 
 | Tool    | Found                    | Decision |
@@ -280,10 +302,10 @@ Each phase ends with: changed-file list, test run, start commands, known gaps, r
 
 - [x] **Phase 1:** environment inspection, this document.
 - [x] **Phase 2:** backend skeleton, config (pydantic-settings, dev/prod/test), DB + pragmas, Alembic baseline, User/Session/Workspace models, Argon2, login/logout/me/change-password, CSRF, throttling, `create-admin` CLI, permission framework, error format, pytest setup with an isolated temp DB.
-- [ ] **Phase 3:** user management (admin), workspace settings, projects CRUD/archive, project members, audit events. Tests for role enforcement and IDOR.
-- [ ] **Phase 4:** issues (types, hierarchy, keys), labels, links, workflow transitions, comments, issue history, filters + pagination. Concurrency test for key generation.
-- [ ] **Phase 5:** React app shell, API client, auth flow, projects list/overview, issue detail, Kanban board (dnd-kit + optimistic rollback), toasts, skeletons, empty and error states.
-- [ ] **Phase 6:** backlog ranking, sprints lifecycle + completion rules, global search and filters UI, notifications (assign, mention, status, deadline CLI), dashboards, My Work.
+- [x] **Phase 3:** user management (admin), workspace settings, projects CRUD/archive, project members, audit events. Tests for role enforcement and IDOR.
+- [x] **Phase 4 (reduced):** tasks (types, keys), workflow transitions, comments, history, filters + pagination. Hierarchy, labels and links deferred (see section 0).
+- [x] **Phase 5:** React app shell, API client, auth flow, projects list/overview, issue detail, Kanban board (dnd-kit + optimistic rollback), toasts, skeletons, empty and error states.
+- [ ] **Phase 6 (partly done):** global search, filters UI, notifications (assign, status, comment, project added), dashboard and My Tasks are done. Backlog ranking, sprints, mentions and the deadline CLI are not.
 - [ ] **Phase 7:** attachments (validation, storage, authorized download), work logs, reports (status/priority/workload, burndown, sprint completion).
 - [ ] **Phase 8:** test coverage gaps, frontend tests, security review, Dockerfiles + compose, GitHub Actions (pytest, ruff, tsc, vitest, vite build, docker build), Nginx + systemd config, HTTPS (certbot) guide, backup/restore scripts, deployment checklist.
 

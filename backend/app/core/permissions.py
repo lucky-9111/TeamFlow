@@ -1,8 +1,8 @@
 """Central role → action matrix.
 
 Coarse permissions are decided here from the user's workspace role and project role.
-Rules that depend on the specific record (e.g. "the issue is assigned to me", "the bug-creation
-setting is enabled for this project") are evaluated in the services, on top of these checks.
+Rules that depend on the specific record (e.g. "the task is assigned to me", "members may create
+tasks in this project") are evaluated in the services, on top of these checks.
 Routes never inline role logic; they call services, which call `require()`.
 """
 
@@ -25,20 +25,13 @@ class Action(StrEnum):
     PROJECT_VIEW = "project.view"
     PROJECT_EDIT = "project.edit"
     PROJECT_MEMBERS_MANAGE = "project.members.manage"
-    ISSUE_CREATE_PLANNING = "issue.create_planning"  # Epic / Story / Task
-    ISSUE_CREATE_BUG = "issue.create_bug"
-    ISSUE_CREATE_SUBTASK = "issue.create_subtask"
-    ISSUE_EDIT_ANY = "issue.edit_any"
-    ISSUE_EDIT_BUGS = "issue.edit_bugs"
-    ISSUE_EDIT_ASSIGNED = "issue.edit_assigned"
-    ISSUE_DELETE = "issue.delete"
-    ISSUE_REVIEW = "issue.review"  # In Review → Done, reopen Done
-    ISSUE_COMMENT = "issue.comment"
-    ISSUE_ATTACH = "issue.attach"
-    WORKLOG_CREATE = "worklog.create"
-    CONTENT_MODERATE = "content.moderate"  # delete others' comments / attachments
-    SPRINT_MANAGE = "sprint.manage"
-    REPORT_VIEW = "report.view"
+    TASK_CREATE = "task.create"  # non-managers are additionally gated by members_can_create_tasks
+    TASK_EDIT_ANY = "task.edit_any"  # edit and reassign any task; assignee/reporter edit their own
+    TASK_DELETE = "task.delete"
+    TASK_REVIEW = "task.review"  # In Review -> Done / back to In Progress, reopen Done
+    TASK_TRANSITION_ANY = "task.transition_any"
+    TASK_COMMENT = "task.comment"
+    COMMENT_MODERATE = "comment.moderate"  # edit/delete other people's comments
 
 
 WORKSPACE_ADMIN_ACTIONS = frozenset(
@@ -51,36 +44,21 @@ WORKSPACE_ADMIN_ACTIONS = frozenset(
     }
 )
 
-_EVERY_MEMBER = frozenset(
-    {
-        Action.PROJECT_VIEW,
-        Action.ISSUE_CREATE_SUBTASK,
-        Action.ISSUE_EDIT_ASSIGNED,
-        Action.ISSUE_COMMENT,
-        Action.ISSUE_ATTACH,
-        Action.WORKLOG_CREATE,
-        Action.REPORT_VIEW,
-    }
-)
+_EVERY_MEMBER = frozenset({Action.PROJECT_VIEW, Action.TASK_CREATE, Action.TASK_COMMENT})
 
 PROJECT_ROLE_ACTIONS: dict[ProjectRole, frozenset[Action]] = {
     ProjectRole.MANAGER: _EVERY_MEMBER
     | {
         Action.PROJECT_EDIT,
         Action.PROJECT_MEMBERS_MANAGE,
-        Action.ISSUE_CREATE_PLANNING,
-        Action.ISSUE_CREATE_BUG,
-        Action.ISSUE_EDIT_ANY,
-        Action.ISSUE_EDIT_BUGS,
-        Action.ISSUE_DELETE,
-        Action.ISSUE_REVIEW,
-        Action.CONTENT_MODERATE,
-        Action.SPRINT_MANAGE,
+        Action.TASK_EDIT_ANY,
+        Action.TASK_DELETE,
+        Action.TASK_REVIEW,
+        Action.TASK_TRANSITION_ANY,
+        Action.COMMENT_MODERATE,
     },
-    # Developer bug creation is additionally gated by the project's allow_developer_bugs setting.
-    ProjectRole.DEVELOPER: _EVERY_MEMBER | {Action.ISSUE_CREATE_BUG},
-    ProjectRole.TESTER: _EVERY_MEMBER
-    | {Action.ISSUE_CREATE_BUG, Action.ISSUE_EDIT_BUGS, Action.ISSUE_REVIEW},
+    ProjectRole.DEVELOPER: _EVERY_MEMBER,
+    ProjectRole.TESTER: _EVERY_MEMBER | {Action.TASK_REVIEW},
     ProjectRole.DESIGNER: _EVERY_MEMBER,
 }
 

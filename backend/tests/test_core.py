@@ -1,7 +1,7 @@
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 
 from app.cli import main as cli_main
@@ -77,19 +77,21 @@ class TestPermissionMatrix:
             assert not can(self._user(), Action.USER_MANAGE, role)
             assert not can(self._user(), Action.PROJECT_CREATE, role)
 
-    def test_manager_manages_sprints_but_developer_does_not(self):
-        assert can(self._user(), Action.SPRINT_MANAGE, ProjectRole.MANAGER)
-        assert not can(self._user(), Action.SPRINT_MANAGE, ProjectRole.DEVELOPER)
+    def test_manager_manages_tasks_but_developer_does_not(self):
+        assert can(self._user(), Action.TASK_EDIT_ANY, ProjectRole.MANAGER)
+        assert can(self._user(), Action.TASK_DELETE, ProjectRole.MANAGER)
+        assert not can(self._user(), Action.TASK_EDIT_ANY, ProjectRole.DEVELOPER)
+        assert not can(self._user(), Action.TASK_DELETE, ProjectRole.DEVELOPER)
 
-    def test_testers_review_and_create_bugs(self):
-        tester = self._user()
-        assert can(tester, Action.ISSUE_REVIEW, ProjectRole.TESTER)
-        assert can(tester, Action.ISSUE_CREATE_BUG, ProjectRole.TESTER)
-        assert not can(tester, Action.ISSUE_CREATE_PLANNING, ProjectRole.TESTER)
+    def test_testers_review_but_developers_and_designers_do_not(self):
+        assert can(self._user(), Action.TASK_REVIEW, ProjectRole.TESTER)
+        assert not can(self._user(), Action.TASK_REVIEW, ProjectRole.DEVELOPER)
+        assert not can(self._user(), Action.TASK_REVIEW, ProjectRole.DESIGNER)
 
-    def test_designer_cannot_create_bugs(self):
-        assert not can(self._user(), Action.ISSUE_CREATE_BUG, ProjectRole.DESIGNER)
-        assert can(self._user(), Action.ISSUE_COMMENT, ProjectRole.DESIGNER)
+    def test_every_project_role_can_create_and_comment(self):
+        for role in ProjectRole:
+            assert can(self._user(), Action.TASK_CREATE, role)
+            assert can(self._user(), Action.TASK_COMMENT, role)
 
     def test_inactive_users_have_no_permissions(self):
         assert not can(self._user(WorkspaceRole.ADMIN, active=False), Action.PROJECT_VIEW)
@@ -115,3 +117,15 @@ def test_create_admin_cli_enforces_password_policy(monkeypatch):
     monkeypatch.setenv("TEAMFLOW_ADMIN_PASSWORD", "short")
     with pytest.raises(SystemExit, match="Password must be"):
         cli_main(["create-admin", "--email", "a@example.com", "--username", "admin", "--full-name", "A"])
+
+
+def test_seed_dev_creates_sample_data_once(db, make_user):
+    from app.models import Task
+
+    make_user(role=WorkspaceRole.ADMIN, username="admin")
+    db.rollback()
+    cli_main(["seed-dev"])
+    assert db.scalar(select(func.count()).select_from(Task)) > 0
+    db.rollback()
+    with pytest.raises(SystemExit, match="already exists"):
+        cli_main(["seed-dev"])
