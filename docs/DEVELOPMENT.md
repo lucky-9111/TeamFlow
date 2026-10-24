@@ -66,3 +66,35 @@ ruff format --check .
 ```bash
 python -m app.cli cleanup      # prune expired sessions and old login attempts
 ```
+
+## Frontend
+
+```powershell
+cd frontend
+npm install
+npm run dev        # http://localhost:5173, proxies /api to http://127.0.0.1:8000
+npm test           # Vitest
+npm run typecheck
+npm run build      # output in frontend/dist
+```
+
+Layout of `frontend/src`:
+
+- `services/api.ts`: the only place that calls `fetch` (cookies, CSRF header, error mapping, 401 handling)
+- `hooks/queries.ts`: TanStack Query hooks per resource, plus `invalidateTaskViews` after task changes
+- `features/auth`: current user, login/logout, route guard (including the forced password change)
+- `layouts/`: app shell (sidebar, top bar, search, notifications)
+- `pages/`: one file per screen
+- `components/ui`: buttons, dialogs, toasts, empty/error states; `components/tasks`: task badges, rows, create dialog
+- `types/api.ts`: TypeScript copies of the backend schemas. Update them when you change `backend/app/schemas`.
+
+## Sample data
+
+```powershell
+cd backend
+python -m app.cli seed-dev
+```
+
+Creates projects `TF` and `MOB`, 11 tasks in different states, and four users
+(`rahul@`, `priya@`, `amit@`, `sneha@example.com`, password `teamflow-demo-123`). It needs an
+existing admin, refuses in production, and exits without changes if the projects already exist.

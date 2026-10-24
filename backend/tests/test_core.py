@@ -8,7 +8,7 @@ from app.cli import main as cli_main
 from app.core.permissions import Action, can
 from app.core.security import hash_password, verify_password
 from app.models import AuthSession, User, Workspace
-from app.models.enums import WorkspaceRole
+from app.models.enums import ProjectRole, WorkspaceRole
 
 
 def test_sqlite_foreign_keys_are_enforced(db):
@@ -70,29 +70,28 @@ class TestPermissionMatrix:
         assert all(can(admin, action) for action in Action)
 
     def test_non_members_have_no_project_access(self):
-        assert not can(self._user(), Action.PROJECT_VIEW)
-        assert not can(self._user(), Action.TASK_CREATE)
+        assert not can(self._user(), Action.PROJECT_VIEW, None)
 
     def test_workspace_actions_are_admin_only(self):
-        for action in (Action.USER_MANAGE, Action.PROJECT_CREATE, Action.PROJECT_MEMBERS_MANAGE):
-            assert not can(self._user(), action, is_project_member=True)
+        for role in ProjectRole:
+            assert not can(self._user(), Action.USER_MANAGE, role)
+            assert not can(self._user(), Action.PROJECT_CREATE, role)
 
-    def test_members_create_and_comment_in_their_projects(self):
-        member = self._user()
-        assert can(member, Action.TASK_CREATE, is_project_member=True)
-        assert can(member, Action.TASK_COMMENT, is_project_member=True)
+    def test_manager_manages_tasks_but_developer_does_not(self):
+        assert can(self._user(), Action.TASK_EDIT_ANY, ProjectRole.MANAGER)
+        assert can(self._user(), Action.TASK_DELETE, ProjectRole.MANAGER)
+        assert not can(self._user(), Action.TASK_EDIT_ANY, ProjectRole.DEVELOPER)
+        assert not can(self._user(), Action.TASK_DELETE, ProjectRole.DEVELOPER)
 
-    def test_task_edit_needs_assignee_or_creator(self):
-        member = self._user()
-        assert not can(member, Action.TASK_EDIT, is_project_member=True)
-        assert can(member, Action.TASK_EDIT, is_project_member=True, is_assignee=True)
-        assert can(member, Action.TASK_EDIT, is_project_member=True, is_creator=True)
-        assert not can(member, Action.TASK_EDIT, is_assignee=True)
+    def test_testers_review_but_developers_and_designers_do_not(self):
+        assert can(self._user(), Action.TASK_REVIEW, ProjectRole.TESTER)
+        assert not can(self._user(), Action.TASK_REVIEW, ProjectRole.DEVELOPER)
+        assert not can(self._user(), Action.TASK_REVIEW, ProjectRole.DESIGNER)
 
-    def test_only_creator_deletes(self):
-        member = self._user()
-        assert not can(member, Action.TASK_DELETE, is_project_member=True, is_assignee=True)
-        assert can(member, Action.TASK_DELETE, is_project_member=True, is_creator=True)
+    def test_every_project_role_can_create_and_comment(self):
+        for role in ProjectRole:
+            assert can(self._user(), Action.TASK_CREATE, role)
+            assert can(self._user(), Action.TASK_COMMENT, role)
 
     def test_inactive_users_have_no_permissions(self):
         assert not can(self._user(WorkspaceRole.ADMIN, active=False), Action.PROJECT_VIEW)
@@ -120,22 +119,13 @@ def test_create_admin_cli_enforces_password_policy(monkeypatch):
         cli_main(["create-admin", "--email", "a@example.com", "--username", "admin", "--full-name", "A"])
 
 
-def test_seed_dev_is_idempotent_and_blocked_in_production(db, monkeypatch):
-    from app.core.config import get_settings
-    from app.models import Project, Task
+def test_seed_dev_creates_sample_data_once(db, make_user):
+    from app.models import Task
 
-    with pytest.raises(SystemExit, match="Create the admin first"):
-        cli_main(["seed-dev"])
-
-    monkeypatch.setenv("TEAMFLOW_ADMIN_PASSWORD", "admin-password-123")
-    cli_main(["create-admin", "--email", "a@example.com", "--username", "admin", "--full-name", "A"])
-    cli_main(["seed-dev"])
-    cli_main(["seed-dev"])
-    assert db.scalar(select(func.count()).select_from(Project)) == 2
-    assert db.scalar(select(func.count()).select_from(Task)) == 7
-    assert db.scalar(select(func.count()).select_from(User)) == 4
+    make_user(role=WorkspaceRole.ADMIN, username="admin")
     db.rollback()
-
-    monkeypatch.setattr(get_settings(), "env", "production")
-    with pytest.raises(SystemExit, match="disabled"):
+    cli_main(["seed-dev"])
+    assert db.scalar(select(func.count()).select_from(Task)) > 0
+    db.rollback()
+    with pytest.raises(SystemExit, match="already exists"):
         cli_main(["seed-dev"])

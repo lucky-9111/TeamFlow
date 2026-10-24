@@ -1,75 +1,81 @@
-"""Central role -> action matrix. Routes never inline role logic; services call `require()`.
+"""Central role → action matrix.
 
-Two roles: workspace `admin` (full access) and `member`. A member's access to a project comes from
-a `project_members` row, and edits to a specific task depend on whether they are its assignee or
-creator. Callers pass those facts as keyword arguments.
+Coarse permissions are decided here from the user's workspace role and project role.
+Rules that depend on the specific record (e.g. "the task is assigned to me", "members may create
+tasks in this project") are evaluated in the services, on top of these checks.
+Routes never inline role logic; they call services, which call `require()`.
 """
 
 from enum import StrEnum
 
 from app.core.errors import PermissionDenied
+from app.models.enums import ProjectRole
 from app.models.user import User
 
 
 class Action(StrEnum):
-    # Admin only
+    # Workspace-level
     WORKSPACE_MANAGE = "workspace.manage"
     USER_MANAGE = "user.manage"
     PROJECT_CREATE = "project.create"
-    PROJECT_EDIT = "project.edit"
     PROJECT_ARCHIVE = "project.archive"
-    PROJECT_MEMBERS_MANAGE = "project.members.manage"
     ACTIVITY_VIEW_ALL = "activity.view_all"
 
-    # Project members
+    # Project-level
     PROJECT_VIEW = "project.view"
-    TASK_CREATE = "task.create"
-    TASK_COMMENT = "task.comment"
-
-    # Record level: admin, or a project member who is the task's assignee or creator
-    TASK_EDIT = "task.edit"
+    PROJECT_EDIT = "project.edit"
+    PROJECT_MEMBERS_MANAGE = "project.members.manage"
+    TASK_CREATE = "task.create"  # non-managers are additionally gated by members_can_create_tasks
+    TASK_EDIT_ANY = "task.edit_any"  # edit and reassign any task; assignee/reporter edit their own
     TASK_DELETE = "task.delete"
+    TASK_REVIEW = "task.review"  # In Review -> Done / back to In Progress, reopen Done
+    TASK_TRANSITION_ANY = "task.transition_any"
+    TASK_COMMENT = "task.comment"
+    COMMENT_MODERATE = "comment.moderate"  # edit/delete other people's comments
 
 
-ADMIN_ONLY = frozenset(
+WORKSPACE_ADMIN_ACTIONS = frozenset(
     {
         Action.WORKSPACE_MANAGE,
         Action.USER_MANAGE,
         Action.PROJECT_CREATE,
-        Action.PROJECT_EDIT,
         Action.PROJECT_ARCHIVE,
-        Action.PROJECT_MEMBERS_MANAGE,
         Action.ACTIVITY_VIEW_ALL,
     }
 )
-MEMBER_OF_PROJECT = frozenset({Action.PROJECT_VIEW, Action.TASK_CREATE, Action.TASK_COMMENT})
+
+_EVERY_MEMBER = frozenset({Action.PROJECT_VIEW, Action.TASK_CREATE, Action.TASK_COMMENT})
+
+PROJECT_ROLE_ACTIONS: dict[ProjectRole, frozenset[Action]] = {
+    ProjectRole.MANAGER: _EVERY_MEMBER
+    | {
+        Action.PROJECT_EDIT,
+        Action.PROJECT_MEMBERS_MANAGE,
+        Action.TASK_EDIT_ANY,
+        Action.TASK_DELETE,
+        Action.TASK_REVIEW,
+        Action.TASK_TRANSITION_ANY,
+        Action.COMMENT_MODERATE,
+    },
+    ProjectRole.DEVELOPER: _EVERY_MEMBER,
+    ProjectRole.TESTER: _EVERY_MEMBER | {Action.TASK_REVIEW},
+    ProjectRole.DESIGNER: _EVERY_MEMBER,
+}
 
 
-def can(
-    user: User,
-    action: Action,
-    *,
-    is_project_member: bool = False,
-    is_assignee: bool = False,
-    is_creator: bool = False,
-) -> bool:
+def can(user: User, action: Action, project_role: ProjectRole | None = None) -> bool:
+    """`project_role` is the user's role in the project in question (None if not a member)."""
     if not user.is_active:
         return False
     if user.is_admin:
-        return True
-    if action in ADMIN_ONLY:
+        return True  # admins have implicit full access to every project
+    if action in WORKSPACE_ADMIN_ACTIONS:
         return False
-    if not is_project_member:
+    if project_role is None:
         return False
-    if action in MEMBER_OF_PROJECT:
-        return True
-    if action == Action.TASK_EDIT:
-        return is_assignee or is_creator
-    if action == Action.TASK_DELETE:
-        return is_creator
-    return False
+    return action in PROJECT_ROLE_ACTIONS[project_role]
 
 
-def require(user: User, action: Action, **facts: bool) -> None:
-    if not can(user, action, **facts):
+def require(user: User, action: Action, project_role: ProjectRole | None = None) -> None:
+    if not can(user, action, project_role):
         raise PermissionDenied("You do not have permission to perform this action")

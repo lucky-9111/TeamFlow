@@ -1,10 +1,12 @@
 from fastapi import APIRouter, Request, Response, status
 
+from app.api import deps
 from app.api.deps import DB, CurrentSession, CurrentUserAllowPending, client_ip
 from app.core.config import get_settings
 from app.schemas.auth import ChangePasswordRequest, CsrfResponse, CurrentUser, LoginRequest, LoginResponse
-from app.schemas.user import ProfileUpdate
+from app.schemas.users import UpdateProfileRequest
 from app.services import auth as auth_service
+from app.services import users as user_service
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -63,10 +65,8 @@ def me(user: CurrentUserAllowPending) -> CurrentUser:
 
 
 @router.patch("/me", response_model=CurrentUser)
-def update_me(body: ProfileUpdate, user: CurrentUserAllowPending, db: DB) -> CurrentUser:
-    user.full_name = body.full_name
-    db.commit()
-    return CurrentUser.model_validate(user)
+def update_me(body: UpdateProfileRequest, user: deps.CurrentUser, db: DB) -> CurrentUser:
+    return CurrentUser.model_validate(user_service.update_profile(db, user, body))
 
 
 @router.get("/csrf", response_model=CsrfResponse)

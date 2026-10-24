@@ -1,441 +1,445 @@
-import re
-from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 
-from sqlalchemy import case, func, or_, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm.exc import StaleDataError
 
-from app.core.errors import Conflict, NotFound, ValidationFailed
-from app.core.permissions import Action, can, require
+from app.core.errors import AppError, Conflict, PermissionDenied, ValidationFailed
+from app.core.permissions import Action
 from app.models.base import utcnow
-from app.models.enums import STATUS_LABELS, TaskPriority, TaskStatus
-from app.models.project import Project, ProjectMember
-from app.models.task import Activity, Task, TaskComment
+from app.models.enums import PRIORITY_RANK, NotificationType, TaskPriority, TaskStatus, TaskType
+from app.models.project import Project
+from app.models.task import Task
 from app.models.user import User
 from app.schemas.common import Page
-from app.schemas.task import ActivityOut, CommentCreate, TaskCreate, TaskOut, TaskUpdate
-from app.schemas.user import ProjectRef, UserBrief
-from app.services import activity, projects
-
-TASK_KEY_RE = re.compile(r"^([A-Za-z][A-Za-z0-9]{1,9})-(\d{1,9})$")
-
-_PRIORITY_ORDER = {TaskPriority.URGENT: 0, TaskPriority.HIGH: 1, TaskPriority.MEDIUM: 2, TaskPriority.LOW: 3}
-_STATUS_ORDER = {TaskStatus.TODO: 0, TaskStatus.IN_PROGRESS: 1, TaskStatus.IN_REVIEW: 2, TaskStatus.DONE: 3}
-SORT_FIELDS = ("created_at", "updated_at", "due_date", "priority", "status", "title")
-
-LOAD = (selectinload(Task.project), selectinload(Task.assignee), selectinload(Task.creator))
-ACTIVITY_LOAD = (
-    selectinload(Activity.actor),
-    selectinload(Activity.project),
-    selectinload(Activity.task).selectinload(Task.project),
+from app.schemas.projects import TaskCounts
+from app.schemas.tasks import (
+    Board,
+    BoardColumn,
+    CreateTaskRequest,
+    ProjectRef,
+    TaskDetail,
+    TaskOut,
+    TaskPermissions,
+    TaskSort,
+    TransitionRequest,
+    UpdateTaskRequest,
 )
-_DISPLAY_FIELDS = {
-    "title": "title",
-    "description": "description",
-    "type": "type",
-    "priority": "priority",
-    "start_date": "start date",
-    "due_date": "due date",
-}
+from app.schemas.users import UserBrief
+from app.services import activity, workflow
+from app.services.access import (
+    ProjectAccess,
+    TaskAccess,
+    accessible_project_ids,
+    ensure_not_archived,
+    member_role,
+)
+from app.services.notifications import notify
+
+MAX_PAGE_SIZE = 100
+BOARD_LIMIT = 500
+
+_STATUS_ORDER = {s: i for i, s in enumerate(TaskStatus)}
+_EAGER = (selectinload(Task.project), selectinload(Task.assignee), selectinload(Task.reporter))
+
+
+class InvalidTransition(AppError):
+    code = "invalid_transition"
 
 
 # ---------------------------------------------------------------- serialization
 
 
-def member_project_ids(db: Session, user: User) -> set[int]:
-    return set(db.scalars(select(ProjectMember.project_id).where(ProjectMember.user_id == user.id)))
+def is_overdue(task: Task, today: date) -> bool:
+    return task.due_date is not None and task.due_date < today and task.status != TaskStatus.DONE
 
 
-def task_out(task: Task, user: User, member_of: set[int]) -> TaskOut:
-    member = task.project_id in member_of
+def to_out(task: Task, today: date, transitions: list[TaskStatus] | None = None) -> TaskOut:
     return TaskOut(
         id=task.id,
         key=task.key,
-        project=ProjectRef.model_validate(task.project),
-        title=task.title,
-        description=task.description,
+        number=task.number,
+        project=ProjectRef(id=task.project.id, key=task.project.key, name=task.project.name),
         type=task.type,
         status=task.status,
         priority=task.priority,
+        title=task.title,
+        description=task.description,
+        reporter=UserBrief.model_validate(task.reporter),
         assignee=UserBrief.model_validate(task.assignee) if task.assignee else None,
-        creator=UserBrief.model_validate(task.creator),
         start_date=task.start_date,
         due_date=task.due_date,
         completed_at=task.completed_at,
         created_at=task.created_at,
         updated_at=task.updated_at,
-        can_edit=_can_edit(user, task, member),
-        can_delete=can(
-            user, Action.TASK_DELETE, is_project_member=member, is_creator=task.creator_id == user.id
-        )
-        and task.project.archived_at is None,
+        version=task.version,
+        is_overdue=is_overdue(task, today),
+        allowed_transitions=transitions or [],
     )
 
 
-def _can_edit(user: User, task: Task, member: bool) -> bool:
-    return task.project.archived_at is None and can(
-        user,
-        Action.TASK_EDIT,
-        is_project_member=member,
-        is_assignee=task.assignee_id == user.id,
-        is_creator=task.creator_id == user.id,
+def _can_edit(user: User, access: ProjectAccess, task: Task) -> bool:
+    if access.project.archived_at is not None or not access.can(user, Action.PROJECT_VIEW):
+        return False
+    return access.can(user, Action.TASK_EDIT_ANY) or user.id in (task.assignee_id, task.reporter_id)
+
+
+def permissions(user: User, access: ProjectAccess, task: Task) -> TaskPermissions:
+    archived = access.project.archived_at is not None
+    can_edit = _can_edit(user, access, task)
+    return TaskPermissions(
+        can_edit=can_edit,
+        can_assign=can_edit,
+        can_delete=not archived and access.can(user, Action.TASK_DELETE),
+        can_comment=not archived and access.can(user, Action.TASK_COMMENT),
     )
 
 
-def activity_out(entry: Activity) -> ActivityOut:
-    return ActivityOut(
-        id=entry.id,
-        actor=UserBrief.model_validate(entry.actor),
-        action=entry.action,
-        field=entry.field,
-        old_value=entry.old_value,
-        new_value=entry.new_value,
-        summary=entry.summary,
-        task_key=entry.task.key if entry.task else None,
-        project_key=entry.project.key,
-        created_at=entry.created_at,
-    )
+def detail(user: User, access: TaskAccess) -> TaskDetail:
+    task = access.task
+    out = to_out(task, activity.today_for(user), workflow.allowed_transitions(user, access, task))
+    return TaskDetail(**out.model_dump(), permissions=permissions(user, access, task))
 
 
-# ---------------------------------------------------------------- lookup
+# ---------------------------------------------------------------- helpers
 
 
-def parse_key(raw: str) -> tuple[str, int]:
-    match = TASK_KEY_RE.match(raw)
-    if not match:
-        raise NotFound("Task not found")
-    return match.group(1).upper(), int(match.group(2))
-
-
-@dataclass
-class TaskAccess:
-    task: Task
-    is_member: bool
-
-
-def get_task(db: Session, user: User, raw_key: str) -> TaskAccess:
-    """404 for both missing tasks and tasks in projects the user cannot see."""
-    project_key, number = parse_key(raw_key)
-    task = db.scalar(
-        select(Task)
-        .join(Project, Project.id == Task.project_id)
-        .where(Project.key == project_key, Task.number == number)
-        .options(*LOAD)
-    )
-    if task is None:
-        raise NotFound("Task not found")
-    member = projects.is_member(db, task.project_id, user.id)
-    if not member and not user.is_admin:
-        raise NotFound("Task not found")
-    return TaskAccess(task, member)
-
-
-def _ensure_project_writable(project: Project) -> None:
-    if project.archived_at is not None:
-        raise Conflict("This project is archived and read-only", code="project_archived")
-
-
-def _validate_assignee(db: Session, project: Project, assignee_id: int | None) -> User | None:
+def _assignee(db: Session, project: Project, assignee_id: int | None) -> User | None:
     if assignee_id is None:
         return None
     user = db.get(User, assignee_id)
-    if user is None or not user.is_active or not projects.is_member(db, project.id, assignee_id):
-        raise ValidationFailed("Assignee must be an active member of the project", code="invalid_assignee")
+    if user is None or not user.is_active or member_role(db, project.id, user.id) is None:
+        raise ValidationFailed(
+            "The assignee must be an active member of this project", code="invalid_assignee"
+        )
     return user
 
 
-def _next_number(db: Session, project_id: int) -> int:
-    # Single atomic UPDATE ... RETURNING, so concurrent creates can never share a number.
-    return db.execute(
-        update(Project)
-        .where(Project.id == project_id)
-        .values(next_task_number=Project.next_task_number + 1)
-        .returning(Project.next_task_number - 1)
-    ).scalar_one()
+def _check_version(task: Task, version: int) -> None:
+    if task.version != version:
+        raise Conflict(
+            "This task was changed by someone else. Reload it and try again.", code="stale_version"
+        )
+
+
+def _commit(db: Session) -> None:
+    try:
+        db.commit()
+    except StaleDataError as exc:
+        db.rollback()
+        raise Conflict(
+            "This task was changed by someone else. Reload it and try again.", code="stale_version"
+        ) from exc
+
+
+def task_counts(db: Session, project_ids: list[int], today: date) -> dict[int, TaskCounts]:
+    counts = {pid: TaskCounts() for pid in project_ids}
+    if not project_ids:
+        return counts
+    rows = db.execute(
+        select(Task.project_id, Task.status, func.count())
+        .where(Task.project_id.in_(project_ids))
+        .group_by(Task.project_id, Task.status)
+    )
+    for pid, status, n in rows:
+        setattr(counts[pid], status.value, n)
+        counts[pid].total += n
+    overdue = db.execute(
+        select(Task.project_id, func.count())
+        .where(Task.project_id.in_(project_ids), Task.due_date < today, Task.status != TaskStatus.DONE)
+        .group_by(Task.project_id)
+    )
+    for pid, n in overdue:
+        counts[pid].overdue = n
+    return counts
 
 
 # ---------------------------------------------------------------- commands
 
 
-def create_task(db: Session, actor: User, project_key: str, data: TaskCreate) -> Task:
-    access = projects.get_project(db, actor, project_key)
+def create_task(db: Session, user: User, access: ProjectAccess, body: CreateTaskRequest) -> TaskDetail:
     project = access.project
-    require(actor, Action.TASK_CREATE, is_project_member=access.is_member)
-    _ensure_project_writable(project)
-    assignee = _validate_assignee(db, project, data.assignee_id)
+    ensure_not_archived(project)
+    access.require(user, Action.TASK_CREATE)
+    if not project.members_can_create_tasks and not access.can(user, Action.TASK_EDIT_ANY):
+        raise PermissionDenied("Only project managers can create tasks in this project")
+    assignee = _assignee(db, project, body.assignee_id)
+
+    # Atomic counter: concurrent creates can never get the same number (UNIQUE is the backstop).
+    number = (
+        db.execute(
+            update(Project)
+            .where(Project.id == project.id)
+            .values(next_task_number=Project.next_task_number + 1)
+            .returning(Project.next_task_number)
+            .execution_options(synchronize_session=False)
+        ).scalar_one()
+        - 1
+    )
 
     task = Task(
-        project_id=project.id,
-        number=_next_number(db, project.id),
-        title=data.title.strip(),
-        description=data.description,
-        type=data.type,
-        status=data.status,
-        priority=data.priority,
-        assignee_id=assignee.id if assignee else None,
-        creator_id=actor.id,
-        start_date=data.start_date,
-        due_date=data.due_date,
-        completed_at=utcnow() if data.status == TaskStatus.DONE else None,
+        project=project,
+        number=number,
+        type=body.type,
+        priority=body.priority,
+        title=body.title,
+        description=body.description,
+        reporter=user,
+        assignee=assignee,
+        start_date=body.start_date,
+        due_date=body.due_date,
     )
     db.add(task)
     db.flush()
-    key = f"{project.key}-{task.number}"
-    activity.record(
-        db, project_id=project.id, actor=actor, task=task, action="task.created", summary=f"created {key}"
-    )
+    activity.record(db, user, "task_created", task=task)
     if assignee:
-        activity.notify(
+        notify(
             db,
-            recipient_id=assignee.id,
-            actor=actor,
+            [assignee],
+            user,
+            NotificationType.TASK_ASSIGNED,
+            f"{user.full_name} assigned {task.key} to you",
             task=task,
-            kind="assigned",
-            message=f"{actor.full_name} assigned you {key}: {task.title}",
         )
     db.commit()
-    return get_task(db, actor, key).task
+    db.refresh(task)
+    return detail(user, TaskAccess(project=project, role=access.role, task=task))
 
 
-def update_task(db: Session, actor: User, access: TaskAccess, data: TaskUpdate) -> Task:
+def update_task(db: Session, user: User, access: TaskAccess, body: UpdateTaskRequest) -> TaskDetail:
     task = access.task
-    require(
-        actor,
-        Action.TASK_EDIT,
-        is_project_member=access.is_member,
-        is_assignee=task.assignee_id == actor.id,
-        is_creator=task.creator_id == actor.id,
-    )
-    _ensure_project_writable(task.project)
-    changes = data.model_dump(exclude_unset=True)
-    for field in ("title", "description", "type", "status", "priority"):
-        if field in changes and changes[field] is None:
-            raise ValidationFailed(f"{field} cannot be null")
+    ensure_not_archived(access.project)
+    if not _can_edit(user, access, task):
+        raise PermissionDenied("You can only edit tasks you reported or are assigned to")
+    _check_version(task, body.version)
 
+    changes = body.model_dump(exclude_unset=True, exclude={"version"})
     start = changes.get("start_date", task.start_date)
     due = changes.get("due_date", task.due_date)
     if start and due and due < start:
-        raise ValidationFailed("due_date must not be before start_date")
+        raise ValidationFailed("Due date cannot be before the start date")
 
-    key = task.key
-    project_id = task.project_id
-
-    def log(action: str, summary: str, field: str, old, new) -> None:
-        activity.record(
-            db,
-            project_id=project_id,
-            actor=actor,
-            task=task,
-            action=action,
-            summary=summary,
-            field=field,
-            old_value=None if old is None else str(old),
-            new_value=None if new is None else str(new),
-        )
-
-    if "status" in changes and changes["status"] != task.status:
-        old, new = task.status, changes["status"]
-        task.status = new
-        task.completed_at = utcnow() if new == TaskStatus.DONE else None
-        log(
-            "task.status_changed",
-            f"moved {key} from {STATUS_LABELS[old]} to {STATUS_LABELS[new]}",
-            "status",
-            old,
-            new,
-        )
-        activity.notify(
-            db,
-            recipient_id=task.assignee_id,
-            actor=actor,
-            task=task,
-            kind="status",
-            message=f"{actor.full_name} moved {key} to {STATUS_LABELS[new]}",
-        )
+    for field in ("title", "description", "type", "priority", "start_date", "due_date"):
+        if field not in changes or changes[field] == getattr(task, field):
+            continue
+        if field in ("title", "type", "priority") and changes[field] is None:
+            raise ValidationFailed(f"{field} cannot be empty")
+        old = getattr(task, field)
+        setattr(task, field, changes[field] if field != "description" else (changes[field] or ""))
+        if field == "description":
+            activity.record(db, user, "task_updated", task=task, field=field)
+        else:
+            activity.record(db, user, "task_updated", task=task, field=field, old=old, new=changes[field])
 
     if "assignee_id" in changes and changes["assignee_id"] != task.assignee_id:
-        old_assignee = task.assignee
-        assignee = _validate_assignee(db, task.project, changes["assignee_id"])
-        task.assignee_id = assignee.id if assignee else None
-        task.assignee = assignee
-        summary = f"assigned {key} to {assignee.full_name}" if assignee else f"unassigned {key}"
-        log(
-            "task.assigned",
-            summary,
-            "assignee",
-            old_assignee.full_name if old_assignee else None,
-            assignee.full_name if assignee else None,
+        new_assignee = _assignee(db, access.project, changes["assignee_id"])
+        old_name = task.assignee.full_name if task.assignee else None
+        task.assignee = new_assignee
+        activity.record(
+            db,
+            user,
+            "task_assigned",
+            task=task,
+            field="assignee",
+            old=old_name,
+            new=new_assignee.full_name if new_assignee else None,
         )
-        if assignee:
-            activity.notify(
+        if new_assignee:
+            notify(
                 db,
-                recipient_id=assignee.id,
-                actor=actor,
+                [new_assignee],
+                user,
+                NotificationType.TASK_ASSIGNED,
+                f"{user.full_name} assigned {task.key} to you",
                 task=task,
-                kind="assigned",
-                message=f"{actor.full_name} assigned you {key}: {task.title}",
             )
 
-    for field, label in _DISPLAY_FIELDS.items():
-        if field in changes and changes[field] != getattr(task, field):
-            old, new = getattr(task, field), changes[field]
-            value = changes[field].strip() if field == "title" else changes[field]
-            setattr(task, field, value)
-            if field == "description":
-                old, new = None, None  # keep long text out of the history rows
-            log("task.updated", f"changed the {label} of {key}", field, old, new)
-
-    db.commit()
-    return get_task(db, actor, key).task
+    _commit(db)
+    db.refresh(task)
+    return detail(user, access)
 
 
-def delete_task(db: Session, actor: User, access: TaskAccess) -> None:
+def transition(db: Session, user: User, access: TaskAccess, body: TransitionRequest) -> TaskDetail:
     task = access.task
-    require(
-        actor, Action.TASK_DELETE, is_project_member=access.is_member, is_creator=task.creator_id == actor.id
-    )
-    _ensure_project_writable(task.project)
-    activity.record(
+    ensure_not_archived(access.project)
+    _check_version(task, body.version)
+    old = task.status
+    if old == body.to_status:
+        return detail(user, access)
+    if not workflow.is_valid(old, body.to_status):
+        allowed = ", ".join(workflow.LABELS[s] for s in workflow.TRANSITIONS[old])
+        raise InvalidTransition(
+            f"A task in {workflow.LABELS[old]} can only move to: {allowed}",
+            details={"from": old, "to": body.to_status},
+        )
+    if not workflow.may_move(user, access, task, body.to_status):
+        raise PermissionDenied(
+            f"You don't have permission to move this task to {workflow.LABELS[body.to_status]}"
+        )
+
+    task.status = body.to_status
+    task.completed_at = utcnow() if body.to_status == TaskStatus.DONE else None
+    activity.record(db, user, "status_changed", task=task, field="status", old=old, new=body.to_status)
+    notify(
         db,
-        project_id=task.project_id,
-        actor=actor,
-        action="task.deleted",
-        summary=f"deleted {task.key}: {task.title}",
+        [task.assignee, task.reporter],
+        user,
+        NotificationType.TASK_STATUS,
+        f"{user.full_name} moved {task.key} to {workflow.LABELS[body.to_status]}",
+        task=task,
     )
+    _commit(db)
+    db.refresh(task)
+    return detail(user, access)
+
+
+def delete_task(db: Session, user: User, access: TaskAccess) -> None:
+    task = access.task
+    ensure_not_archived(access.project)
+    access.require(user, Action.TASK_DELETE)
+    # Project-level event (task_id None) so the deletion stays in the feed after the task is gone.
+    activity.record(db, user, "task_deleted", project=access.project, target=f"{task.key} {task.title}")
     db.delete(task)
     db.commit()
-
-
-def add_comment(db: Session, actor: User, access: TaskAccess, data: CommentCreate) -> TaskComment:
-    task = access.task
-    require(actor, Action.TASK_COMMENT, is_project_member=access.is_member)
-    comment = TaskComment(task_id=task.id, author_id=actor.id, body=data.body.strip())
-    db.add(comment)
-    activity.record(
-        db,
-        project_id=task.project_id,
-        actor=actor,
-        task=task,
-        action="task.commented",
-        summary=f"commented on {task.key}",
-    )
-    for recipient in {task.assignee_id, task.creator_id}:
-        activity.notify(
-            db,
-            recipient_id=recipient,
-            actor=actor,
-            task=task,
-            kind="comment",
-            message=f"{actor.full_name} commented on {task.key}",
-        )
-    db.commit()
-    db.refresh(comment)
-    return comment
-
-
-def list_comments(db: Session, task: Task) -> list[TaskComment]:
-    return list(
-        db.scalars(
-            select(TaskComment)
-            .where(TaskComment.task_id == task.id)
-            .options(selectinload(TaskComment.author))
-            .order_by(TaskComment.created_at, TaskComment.id)
-        )
-    )
-
-
-def list_task_activity(db: Session, task: Task) -> list[ActivityOut]:
-    rows = db.scalars(
-        select(Activity)
-        .where(Activity.task_id == task.id)
-        .options(*ACTIVITY_LOAD)
-        .order_by(Activity.created_at.desc(), Activity.id.desc())
-    )
-    return [activity_out(row) for row in rows]
 
 
 # ---------------------------------------------------------------- queries
 
 
-def _visible(stmt, db: Session, user: User):
-    visible = projects.accessible_project_ids(db, user)
-    return stmt if visible is None else stmt.where(Task.project_id.in_(visible))
-
-
-def list_tasks(
-    db: Session,
+def _filtered(
+    stmt,
     user: User,
+    today: date,
     *,
-    project: str | None = None,
     status: list[TaskStatus] | None = None,
     priority: list[TaskPriority] | None = None,
+    type_: list[TaskType] | None = None,
     assignee: str | None = None,
     q: str | None = None,
-    overdue: bool = False,
-    due_before: date | None = None,
-    sort: str = "created_at",
-    order: str = "desc",
-    page: int = 1,
-    page_size: int = 25,
-    include_archived: bool = False,
-) -> Page[TaskOut]:
-    stmt = _visible(select(Task).join(Project, Project.id == Task.project_id), db, user)
-    if not include_archived:
-        stmt = stmt.where(Project.archived_at.is_(None))
-    if project:
-        stmt = stmt.where(Project.key == project.upper())
+    overdue: bool | None = None,
+):
     if status:
         stmt = stmt.where(Task.status.in_(status))
     if priority:
         stmt = stmt.where(Task.priority.in_(priority))
+    if type_:
+        stmt = stmt.where(Task.type.in_(type_))
     if assignee == "me":
         stmt = stmt.where(Task.assignee_id == user.id)
     elif assignee == "none":
         stmt = stmt.where(Task.assignee_id.is_(None))
     elif assignee:
         if not assignee.isdigit():
-            raise ValidationFailed("assignee must be 'me', 'none' or a user id")
+            raise ValidationFailed("assignee must be a user id, 'me' or 'none'")
         stmt = stmt.where(Task.assignee_id == int(assignee))
-    if q and q.strip():
-        term = q.strip()
-        like = f"%{term}%"
-        clauses = [Task.title.ilike(like)]
-        match = TASK_KEY_RE.match(term)
-        if match:
-            clauses.append((Project.key == match.group(1).upper()) & (Task.number == int(match.group(2))))
-        stmt = stmt.where(or_(*clauses))
+    if q:
+        q = q.strip()
+        parts = q.rsplit("-", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            stmt = stmt.where(
+                (Task.title.icontains(q, autoescape=True))
+                | ((Project.key == parts[0].upper()) & (Task.number == int(parts[1])))
+            )
+        else:
+            stmt = stmt.where(Task.title.icontains(q, autoescape=True))
     if overdue:
-        stmt = stmt.where(Task.due_date < projects.today(), Task.status != TaskStatus.DONE)
-    if due_before:
-        stmt = stmt.where(Task.due_date <= due_before)
+        stmt = stmt.where(Task.due_date < today, Task.status != TaskStatus.DONE)
+    return stmt
+
+
+def _sorted(stmt, sort: TaskSort, descending: bool):
+    priority_rank = case(PRIORITY_RANK, value=Task.priority)
+    status_rank = case(_STATUS_ORDER, value=Task.status)
+    column = {
+        "created": Task.created_at,
+        "updated": Task.updated_at,
+        "due": Task.due_date,
+        "priority": priority_rank,
+        "status": status_rank,
+        "key": Task.number,
+    }[sort]
+    primary = column.desc() if descending else column.asc()
+    if sort == "due":
+        # Tasks without a due date always go last.
+        return stmt.order_by(Task.due_date.is_(None), primary, Task.id.desc())
+    return stmt.order_by(primary, Task.id.desc())
+
+
+def list_tasks(
+    db: Session,
+    user: User,
+    *,
+    project: str | None,
+    sort: TaskSort,
+    descending: bool,
+    page: int,
+    page_size: int,
+    **filters,
+) -> Page[TaskOut]:
+    today = activity.today_for(user)
+    page_size = max(1, min(page_size, MAX_PAGE_SIZE))
+    stmt = (
+        select(Task)
+        .join(Project, Task.project_id == Project.id)
+        .where(Task.project_id.in_(accessible_project_ids(user)))
+    )
+    if project:
+        stmt = stmt.where(Project.key == project.upper())
+    else:
+        stmt = stmt.where(Project.archived_at.is_(None))
+    stmt = _filtered(stmt, user, today, **filters)
 
     total = db.scalar(select(func.count()).select_from(stmt.subquery()))
+    rows = db.scalars(
+        _sorted(stmt, sort, descending).options(*_EAGER).offset((page - 1) * page_size).limit(page_size)
+    )
+    return Page(items=[to_out(t, today) for t in rows], total=total, page=page, page_size=page_size)
 
-    if sort not in SORT_FIELDS:
-        raise ValidationFailed(f"sort must be one of {', '.join(SORT_FIELDS)}")
-    if sort == "priority":
-        column = case(_PRIORITY_ORDER, value=Task.priority)
-    elif sort == "status":
-        column = case(_STATUS_ORDER, value=Task.status)
-    else:
-        column = getattr(Task, sort)
-    ordered = column.asc() if order == "asc" else column.desc()
-    if sort == "due_date":
-        ordered = ordered.nulls_last()
+
+def board(db: Session, user: User, access: ProjectAccess, **filters) -> Board:
+    today = activity.today_for(user)
     stmt = (
-        stmt.order_by(ordered, Task.id.desc()).options(*LOAD).limit(page_size).offset((page - 1) * page_size)
+        select(Task).join(Project, Task.project_id == Project.id).where(Task.project_id == access.project.id)
+    )
+    stmt = _filtered(stmt, user, today, **filters)
+    priority_rank = case(PRIORITY_RANK, value=Task.priority)
+    rows = db.scalars(
+        stmt.options(*_EAGER).order_by(priority_rank.desc(), Task.updated_at.desc()).limit(BOARD_LIMIT)
     )
 
-    member_of = member_project_ids(db, user)
-    items = [task_out(t, user, member_of) for t in db.scalars(stmt)]
-    return Page[TaskOut](items=items, total=total, page=page, page_size=page_size)
+    columns = {s: BoardColumn(status=s, tasks=[]) for s in TaskStatus}
+    for task in rows:
+        columns[task.status].tasks.append(
+            to_out(task, today, workflow.allowed_transitions(user, access, task))
+        )
+    project = access.project
+    return Board(
+        project=ProjectRef(id=project.id, key=project.key, name=project.name), columns=list(columns.values())
+    )
 
 
-def search(db: Session, user: User, q: str) -> tuple[list[TaskOut], list[Project]]:
-    tasks = list_tasks(db, user, q=q, page_size=8, include_archived=True).items
-    found = projects.list_projects(db, user, include_archived=False, q=q)[:5]
-    return tasks, found
+def open_task_counts(db: Session, user_ids: list[int], project_id: int | None = None) -> dict[int, int]:
+    if not user_ids:
+        return {}
+    stmt = (
+        select(Task.assignee_id, func.count())
+        .join(Project, Task.project_id == Project.id)
+        .where(Task.assignee_id.in_(user_ids), Task.status != TaskStatus.DONE, Project.archived_at.is_(None))
+        .group_by(Task.assignee_id)
+    )
+    if project_id is not None:
+        stmt = stmt.where(Task.project_id == project_id)
+    return dict(db.execute(stmt).all())
 
 
-def week_ahead() -> date:
-    return projects.today() + timedelta(days=7)
+def unassign_open_tasks(db: Session, actor: User, project: Project, user_id: int) -> None:
+    """Called when someone leaves a project: their open tasks go back to the unassigned pool."""
+    tasks = db.scalars(
+        select(Task).where(
+            Task.project_id == project.id, Task.assignee_id == user_id, Task.status != TaskStatus.DONE
+        )
+    )
+    for task in tasks:
+        old = task.assignee.full_name if task.assignee else None
+        task.assignee = None
+        activity.record(db, actor, "task_assigned", task=task, field="assignee", old=old, new=None)

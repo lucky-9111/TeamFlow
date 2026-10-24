@@ -3,12 +3,12 @@
 from app.models.base import Base
 from app.models.notification import Notification
 from app.models.project import Project, ProjectMember
-from app.models.task import Activity, Task, TaskComment
+from app.models.task import ActivityEvent, Task, TaskComment
 from app.models.user import AuthSession, LoginAttempt, User
 from app.models.workspace import Workspace
 
 __all__ = [
-    "Activity",
+    "ActivityEvent",
     "AuthSession",
     "Base",
     "LoginAttempt",

@@ -1,178 +1,115 @@
-import type {
-  Activity,
-  Comment,
-  CurrentUser,
-  Dashboard,
-  NotificationList,
-  Page,
-  Project,
-  ProjectDetail,
-  SearchResults,
-  Task,
-  TaskFilters,
-  TaskInput,
-  TeamMember,
-  WorkspaceRole,
-} from '../types'
+/**
+ * The single place the app talks to the backend.
+ *
+ * - Sends the session cookie (same origin) and echoes the CSRF cookie in X-CSRF-Token on writes.
+ * - Turns the backend's {error: {code, message, details}} body into an ApiError.
+ * - Broadcasts "unauthorized" on 401 so the auth layer can send the user back to the login page.
+ */
 
-const BASE = (import.meta.env.VITE_API_BASE_URL ?? '') + '/api/v1'
-const CSRF_COOKIE = 'teamflow_csrf'
-const CSRF_HEADER = 'X-CSRF-Token'
-
-export interface FieldError {
-  loc: (string | number)[]
-  msg: string
-}
+const BASE = import.meta.env.VITE_API_BASE_URL || "/api/v1";
+const CSRF_COOKIE = "teamflow_csrf";
+const CSRF_HEADER = "X-CSRF-Token";
+export const UNAUTHORIZED_EVENT = "teamflow:unauthorized";
 
 export class ApiError extends Error {
-  status: number
-  code: string
-  details: FieldError[] | null
-
-  constructor(status: number, code: string, message: string, details: FieldError[] | null = null) {
-    super(message)
-    this.status = status
-    this.code = code
-    this.details = details
+  constructor(
+    public status: number,
+    public code: string,
+    message: string,
+    public details?: unknown,
+  ) {
+    super(message);
   }
 
-  /** Validation messages keyed by field name, for inline form errors. */
-  get fieldErrors(): Record<string, string> {
-    const out: Record<string, string> = {}
-    for (const d of this.details ?? []) {
-      const field = String(d.loc[d.loc.length - 1] ?? '')
-      if (field && !(field in out)) out[field] = d.msg.replace(/^Value error, /, '')
+  /** Field-level messages from a 422 response, keyed by the last part of the location. */
+  fieldErrors(): Record<string, string> {
+    if (!Array.isArray(this.details)) return {};
+    const out: Record<string, string> = {};
+    for (const item of this.details as { loc?: unknown[]; msg?: string }[]) {
+      const field = item.loc?.[item.loc.length - 1];
+      if (typeof field === "string" && item.msg) out[field] = item.msg.replace(/^Value error, /, "");
     }
-    return out
+    return out;
   }
 }
 
-/** Called when the server says our session is gone, so the UI can send the user to /login. */
-let onUnauthorized: (() => void) | null = null
-export function setUnauthorizedHandler(fn: (() => void) | null) {
-  onUnauthorized = fn
+function readCookie(name: string): string | null {
+  const match = document.cookie.split("; ").find((c) => c.startsWith(`${name}=`));
+  return match ? decodeURIComponent(match.slice(name.length + 1)) : null;
 }
 
-function csrfToken(): string {
-  const match = document.cookie.split('; ').find((c) => c.startsWith(CSRF_COOKIE + '='))
-  return match ? decodeURIComponent(match.split('=')[1]) : ''
-}
+type Query = Record<string, string | number | boolean | (string | number)[] | null | undefined>;
 
-type Query = Record<string, string | number | boolean | string[] | undefined | null>
-
-function toQuery(params?: Query): string {
-  if (!params) return ''
-  const search = new URLSearchParams()
+export function toQuery(params: Query = {}): string {
+  const search = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
-    if (value === undefined || value === null || value === '' || value === false) continue
-    if (Array.isArray(value)) value.forEach((v) => search.append(key, v))
-    else search.set(key, String(value))
+    if (value === undefined || value === null || value === "") continue;
+    if (Array.isArray(value)) value.forEach((v) => search.append(key, String(v)));
+    else search.set(key, String(value));
   }
-  const text = search.toString()
-  return text ? `?${text}` : ''
+  const s = search.toString();
+  return s ? `?${s}` : "";
 }
 
-async function request<T>(method: string, path: string, body?: unknown, query?: Query): Promise<T> {
-  const headers: Record<string, string> = {}
-  if (body !== undefined) headers['Content-Type'] = 'application/json'
-  if (method !== 'GET') headers[CSRF_HEADER] = csrfToken()
+async function request<T>(method: string, path: string, body?: unknown, retried = false): Promise<T> {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (method !== "GET") {
+    const csrf = readCookie(CSRF_COOKIE);
+    if (csrf) headers[CSRF_HEADER] = csrf;
+  }
 
-  let response: Response
+  let response: Response;
   try {
-    response = await fetch(BASE + path + toQuery(query), {
+    response = await fetch(`${BASE}${path}`, {
       method,
       headers,
-      credentials: 'include',
+      credentials: "same-origin",
       body: body === undefined ? undefined : JSON.stringify(body),
-    })
+    });
   } catch {
-    throw new ApiError(0, 'network_error', 'Cannot reach the server. Check your connection and try again.')
+    throw new ApiError(0, "network_error", "Cannot reach the server. Check that the backend is running.");
   }
 
-  if (response.status === 204) return undefined as T
+  if (response.status === 204) return undefined as T;
 
-  let payload: unknown = null
+  let data: unknown = null;
   try {
-    payload = await response.json()
+    data = await response.json();
   } catch {
-    /* non-JSON body */
+    // Non-JSON body (e.g. a proxy error page); handled below.
   }
 
   if (!response.ok) {
-    const err = (payload as { error?: { code?: string; message?: string; details?: FieldError[] } } | null)?.error
-    const code = err?.code ?? 'http_error'
-    // A 401 from /auth/login is just "wrong password"; anywhere else it means the session is gone.
-    if (response.status === 401 && path !== '/auth/login') onUnauthorized?.()
-    throw new ApiError(
+    const err = (data as { error?: { code: string; message: string; details?: unknown } })?.error;
+    const apiError = new ApiError(
       response.status,
-      code,
-      err?.message ?? `Request failed (${response.status})`,
-      Array.isArray(err?.details) ? err.details : null,
-    )
+      err?.code ?? "http_error",
+      err?.message ?? (response.status >= 500 ? "Something went wrong on the server." : response.statusText),
+      err?.details,
+    );
+    // The CSRF cookie can go missing (cleared cookies, new tab); fetch a fresh one and retry once.
+    if (apiError.code === "csrf_failed" && !retried) {
+      await request("GET", "/auth/csrf");
+      return request<T>(method, path, body, true);
+    }
+    if (response.status === 401 && path !== "/auth/login") {
+      window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT, { detail: apiError }));
+    }
+    throw apiError;
   }
-  return payload as T
-}
-
-const get = <T>(path: string, query?: Query) => request<T>('GET', path, undefined, query)
-const post = <T>(path: string, body?: unknown) => request<T>('POST', path, body ?? {})
-const patch = <T>(path: string, body: unknown) => request<T>('PATCH', path, body)
-const del = (path: string) => request<void>('DELETE', path)
-
-export interface ProjectInput {
-  key?: string
-  name?: string
-  description?: string
-  status?: string
-  start_date?: string | null
-  end_date?: string | null
+  return data as T;
 }
 
 export const api = {
-  login: (email: string, password: string) =>
-    post<{ user: CurrentUser; csrf_token: string }>('/auth/login', { email, password }),
-  logout: () => post<void>('/auth/logout'),
-  me: () => get<CurrentUser>('/auth/me'),
-  updateMe: (full_name: string) => patch<CurrentUser>('/auth/me', { full_name }),
-  changePassword: (current_password: string, new_password: string) =>
-    post<void>('/auth/change-password', { current_password, new_password }),
+  get: <T>(path: string, params?: Query) => request<T>("GET", path + toQuery(params)),
+  post: <T>(path: string, body?: unknown) => request<T>("POST", path, body ?? {}),
+  patch: <T>(path: string, body: unknown) => request<T>("PATCH", path, body),
+  delete: (path: string) => request<void>("DELETE", path),
+};
 
-  dashboard: () => get<Dashboard>('/dashboard'),
-  search: (q: string) => get<SearchResults>('/search', { q }),
-  activity: (query: { project?: string; page?: number; page_size?: number }) =>
-    get<Page<Activity>>('/activity', query),
-  notifications: () => get<NotificationList>('/notifications'),
-  markNotificationRead: (id: number) => post<void>(`/notifications/${id}/read`),
-  markAllNotificationsRead: () => post<void>('/notifications/read-all'),
-  workspace: () => get<{ name: string }>('/workspace'),
-  renameWorkspace: (name: string) => patch<{ name: string }>('/workspace', { name }),
-
-  projects: (query?: { include_archived?: boolean; q?: string }) => get<Project[]>('/projects', query),
-  project: (key: string) => get<ProjectDetail>(`/projects/${key}`),
-  createProject: (input: ProjectInput) => post<ProjectDetail>('/projects', input),
-  updateProject: (key: string, input: ProjectInput) => patch<ProjectDetail>(`/projects/${key}`, input),
-  archiveProject: (key: string, archived: boolean) =>
-    post<ProjectDetail>(`/projects/${key}/${archived ? 'archive' : 'unarchive'}`),
-  addMember: (key: string, user_id: number) => post<ProjectDetail>(`/projects/${key}/members`, { user_id }),
-  removeMember: (key: string, user_id: number) => del(`/projects/${key}/members/${user_id}`),
-
-  tasks: (filters: TaskFilters) => get<Page<Task>>('/tasks', filters as Query),
-  task: (key: string) => get<Task>(`/tasks/${key}`),
-  createTask: (project: string, input: TaskInput) => post<Task>(`/projects/${project}/tasks`, input),
-  updateTask: (key: string, input: Partial<TaskInput>) => patch<Task>(`/tasks/${key}`, input),
-  deleteTask: (key: string) => del(`/tasks/${key}`),
-  comments: (key: string) => get<Comment[]>(`/tasks/${key}/comments`),
-  addComment: (key: string, body: string) => post<Comment>(`/tasks/${key}/comments`, { body }),
-  taskActivity: (key: string) => get<Activity[]>(`/tasks/${key}/activity`),
-
-  team: () => get<TeamMember[]>('/users'),
-  createUser: (input: {
-    email: string
-    username: string
-    full_name: string
-    password: string
-    workspace_role: WorkspaceRole
-  }) => post<TeamMember>('/users', input),
-  updateUser: (id: number, input: { full_name?: string; workspace_role?: WorkspaceRole; is_active?: boolean }) =>
-    patch<TeamMember>(`/users/${id}`, input),
-  resetPassword: (id: number, new_password: string) => post<void>(`/users/${id}/reset-password`, { new_password }),
+export function errorMessage(error: unknown): string {
+  if (error instanceof ApiError) return error.message;
+  if (error instanceof Error) return error.message;
+  return "Something went wrong.";
 }
