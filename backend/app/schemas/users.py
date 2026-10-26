@@ -52,6 +52,7 @@ class ResetPasswordRequest(APIModel):
 class UpdateProfileRequest(APIModel):
     full_name: str | None = Field(default=None, min_length=1, max_length=120)
     timezone: str | None = Field(default=None, min_length=1, max_length=64)
+    due_reminders: bool | None = None
 
 
 class Workspace(ORMModel):

@@ -195,6 +195,8 @@ def update_profile(db: Session, user: User, body: UpdateProfileRequest) -> User:
         except (ZoneInfoNotFoundError, ValueError) as exc:
             raise ValidationFailed("Unknown timezone") from exc
         user.timezone = body.timezone
+    if body.due_reminders is not None:
+        user.due_reminders = body.due_reminders
     db.commit()
     return user
 

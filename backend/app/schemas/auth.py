@@ -25,6 +25,7 @@ class CurrentUser(ORMModel):
     workspace_role: WorkspaceRole
     must_change_password: bool
     timezone: str
+    due_reminders: bool
     last_login_at: datetime | None
 
 

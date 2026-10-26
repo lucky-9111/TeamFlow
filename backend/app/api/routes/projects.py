@@ -13,6 +13,7 @@ from app.schemas.projects import (
 )
 from app.schemas.tasks import Board, CreateTaskRequest, TaskDetail
 from app.services import projects as project_service
+from app.services import task_relations
 from app.services import tasks as task_service
 from app.services.access import get_project
 
@@ -86,6 +87,11 @@ def remove_member(key: str, user_id: int, user: CurrentUser, db: DB) -> Response
 @router.post("/{key}/tasks", response_model=TaskDetail, status_code=status.HTTP_201_CREATED)
 def create_task(key: str, body: CreateTaskRequest, user: CurrentUser, db: DB) -> TaskDetail:
     return task_service.create_task(db, user, get_project(db, user, key), body)
+
+
+@router.get("/{key}/labels", response_model=list[str])
+def project_labels(key: str, user: CurrentUser, db: DB) -> list[str]:
+    return task_relations.project_labels(db, get_project(db, user, key).project.id)
 
 
 @router.get("/{key}/board", response_model=Board)

@@ -1,7 +1,8 @@
+import re
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from app.models.enums import TaskPriority, TaskStatus, TaskType
 from app.schemas.common import APIModel
@@ -26,6 +27,8 @@ class TaskOut(APIModel):
     description: str
     reporter: UserBrief
     assignee: UserBrief | None
+    parent_key: str | None = None
+    labels: list[str] = []
     start_date: date | None
     due_date: date | None
     completed_at: datetime | None
@@ -45,6 +48,81 @@ class TaskPermissions(APIModel):
 
 class TaskDetail(TaskOut):
     permissions: TaskPermissions
+    watchers: list[UserBrief] = []
+    watching: bool = False
+
+
+class SubtaskList(APIModel):
+    items: list[TaskOut]
+    done: int
+    total: int
+
+
+class DependencyRequest(APIModel):
+    depends_on: str = Field(min_length=1, max_length=30, description="key of the prerequisite task")
+
+
+class TaskDependencies(APIModel):
+    depends_on: list[TaskOut]
+    blocks: list[TaskOut]
+    unfinished: int = Field(description="prerequisites that are not Done yet")
+
+
+_LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9 _-]*$")
+
+
+def normalize_label(value: str) -> str:
+    """Lower-case, single spaces; letters, digits, spaces, '-' and '_' only."""
+    name = " ".join(value.split()).lower()
+    if not name or len(name) > 30 or not _LABEL_RE.match(name):
+        raise ValueError("Labels are 1-30 characters: letters, numbers, spaces, '-' and '_'")
+    return name
+
+
+class LabelRequest(APIModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def _normalize(cls, v: str) -> str:
+        return normalize_label(v)
+
+
+BULK_LIMIT = 100
+
+
+class BulkUpdateRequest(APIModel):
+    """Exactly one change per request, applied to every selected task."""
+
+    task_keys: list[str] = Field(min_length=1, max_length=BULK_LIMIT)
+    assignee_id: int | None = None
+    priority: TaskPriority | None = None
+    status: TaskStatus | None = None
+    add_label: str | None = None
+
+    @field_validator("add_label")
+    @classmethod
+    def _label(cls, v: str | None) -> str | None:
+        return None if v is None else normalize_label(v)
+
+    @model_validator(mode="after")
+    def _one_change(self) -> "BulkUpdateRequest":
+        changes = self.model_fields_set - {"task_keys"}
+        if len(changes) != 1:
+            raise ValueError("Send exactly one of assignee_id, priority, status or add_label")
+        if changes != {"assignee_id"} and getattr(self, changes.pop()) is None:
+            raise ValueError("The new value cannot be empty")
+        return self
+
+
+class BulkFailure(APIModel):
+    key: str
+    message: str
+
+
+class BulkResult(APIModel):
+    updated: list[str]
+    failed: list[BulkFailure]
 
 
 class CreateTaskRequest(APIModel):

@@ -17,6 +17,7 @@ from app.models.enums import ProjectRole, TaskPriority, TaskStatus, TaskType, Wo
 from app.schemas.projects import AddMemberRequest, CreateProjectRequest
 from app.schemas.tasks import CreateTaskRequest, TransitionRequest
 from app.services import projects as project_service
+from app.services import reminders as reminder_service
 from app.services import tasks as task_service
 from app.services.access import get_project, get_task
 from app.services.users import create_user
@@ -188,6 +189,13 @@ def cmd_seed_dev(args: argparse.Namespace) -> None:
     print(f"Sample users ({', '.join(u[0] for u in DEMO_USERS)}) use the password: {DEMO_PASSWORD}")
 
 
+def cmd_send_due_reminders(args: argparse.Namespace) -> None:
+    """Notify assignees and watchers about tasks due soon. Run once a day; safe to re-run."""
+    with SessionLocal() as db:
+        count = reminder_service.send_due_reminders(db, date.today(), days_ahead=args.days_ahead)
+    print(f"Sent due-date reminders for {count} tasks.")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -205,6 +213,10 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("cleanup", help="prune expired sessions and old login attempts")
     p.add_argument("--attempt-days", type=int, default=30)
     p.set_defaults(func=cmd_cleanup)
+
+    p = sub.add_parser("send-due-reminders", help="notify about tasks due today or soon (run daily)")
+    p.add_argument("--days-ahead", type=int, default=1, choices=range(0, 8), metavar="0-7")
+    p.set_defaults(func=cmd_send_due_reminders)
 
     args = parser.parse_args(argv)
     args.func(args)

@@ -21,7 +21,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from app.core.config import BACKEND_DIR, get_settings  # noqa: E402
 from app.core.database import SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Base, User  # noqa: E402
+from app.models import Base, Task, User  # noqa: E402
 from app.models.enums import WorkspaceRole  # noqa: E402
 from app.services.users import create_user  # noqa: E402
 
@@ -49,6 +49,8 @@ def _database():
 def _clean_tables():
     yield
     with engine.begin() as conn:
+        # tasks.parent_id is a RESTRICT self-reference, so unlink subtasks before the bulk delete.
+        conn.execute(Task.__table__.update().values(parent_id=None))
         for table in reversed(Base.metadata.sorted_tables):
             conn.execute(table.delete())
 

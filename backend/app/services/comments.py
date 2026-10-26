@@ -12,6 +12,7 @@ from app.schemas.users import UserBrief
 from app.services import activity
 from app.services.access import TaskAccess, ensure_not_archived, get_task
 from app.services.notifications import notify
+from app.services.tasks import watchers_to_notify
 
 
 def _can_modify(user: User, access: TaskAccess, comment: TaskComment) -> bool:
@@ -50,7 +51,7 @@ def add_comment(db: Session, user: User, access: TaskAccess, body: str) -> Comme
     activity.record(db, user, "comment_added", task=task)
     notify(
         db,
-        [task.assignee, task.reporter],
+        [task.assignee, task.reporter, *watchers_to_notify(db, task)],
         user,
         NotificationType.TASK_COMMENT,
         f"{user.full_name} commented on {task.key}",

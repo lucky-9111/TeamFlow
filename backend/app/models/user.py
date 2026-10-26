@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, ForeignKey, Index, String
+from sqlalchemy import Boolean, ForeignKey, Index, String, true
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UTCDateTime, utcnow
@@ -21,6 +21,8 @@ class User(TimestampMixin, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     timezone: Mapped[str] = mapped_column(String(64), default="UTC", nullable=False)
+    # Notification preference for the due-date reminder job (python -m app.cli send-due-reminders).
+    due_reminders: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true(), nullable=False)
     last_login_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
     sessions: Mapped[list["AuthSession"]] = relationship(

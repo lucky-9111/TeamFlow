@@ -1,6 +1,6 @@
 from datetime import date, datetime
 
-from sqlalchemy import Date, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import CheckConstraint, Date, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UTCDateTime, utcnow
@@ -34,6 +34,8 @@ class Task(TimestampMixin, Base):
     assignee_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), index=True)
     start_date: Mapped[date | None] = mapped_column(Date)
     due_date: Mapped[date | None] = mapped_column(Date, index=True)
+    # One level only: a subtask's parent must itself be a top-level task (enforced in the service).
+    parent_id: Mapped[int | None] = mapped_column(ForeignKey("tasks.id", ondelete="RESTRICT"), index=True)
     completed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     # Optimistic concurrency: a stale update raises StaleDataError, mapped to 409 in the service.
     version: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -43,6 +45,11 @@ class Task(TimestampMixin, Base):
     project: Mapped[Project] = relationship()
     reporter: Mapped[User] = relationship(foreign_keys=[reporter_id])
     assignee: Mapped[User | None] = relationship(foreign_keys=[assignee_id])
+    parent: Mapped["Task | None"] = relationship(remote_side=[id])
+    labels: Mapped[list["TaskLabel"]] = relationship(
+        cascade="all, delete-orphan", passive_deletes=True, order_by="TaskLabel.name"
+    )
+    watchers: Mapped[list["TaskWatcher"]] = relationship(cascade="all, delete-orphan", passive_deletes=True)
 
     @property
     def key(self) -> str:
@@ -85,3 +92,49 @@ class ActivityEvent(Base):
     actor: Mapped[User] = relationship()
     project: Mapped[Project | None] = relationship()
     task: Mapped[Task | None] = relationship()
+
+
+class TaskDependency(Base):
+    """`task` depends on `depends_on`: the prerequisite should be finished first. Same project only."""
+
+    __tablename__ = "task_dependencies"
+    __table_args__ = (CheckConstraint("task_id != depends_on_id", name="no_self_dependency"),)
+
+    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), primary_key=True)
+    depends_on_id: Mapped[int] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), primary_key=True, index=True
+    )
+    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, nullable=False)
+
+
+class TaskLabel(Base):
+    """Names are stored lower-case; the primary key stops the same label twice on one task."""
+
+    __tablename__ = "task_labels"
+
+    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), primary_key=True)
+    name: Mapped[str] = mapped_column(String(30), primary_key=True, index=True)
+
+
+class TaskWatcher(Base):
+    __tablename__ = "task_watchers"
+
+    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, nullable=False)
+
+    user: Mapped[User] = relationship()
+
+
+class TaskReminder(Base):
+    """One row per (task, due date) reminder sent. The primary key makes the reminder job idempotent:
+    re-running it, or two runs overlapping, can never send the same reminder twice."""
+
+    __tablename__ = "task_reminders"
+
+    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), primary_key=True)
+    due_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    sent_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, nullable=False)

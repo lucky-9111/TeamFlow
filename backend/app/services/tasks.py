@@ -9,7 +9,7 @@ from app.core.permissions import Action
 from app.models.base import utcnow
 from app.models.enums import PRIORITY_RANK, NotificationType, TaskPriority, TaskStatus, TaskType
 from app.models.project import Project
-from app.models.task import Task
+from app.models.task import Task, TaskLabel
 from app.models.user import User
 from app.schemas.common import Page
 from app.schemas.projects import TaskCounts
@@ -18,6 +18,7 @@ from app.schemas.tasks import (
     BoardColumn,
     CreateTaskRequest,
     ProjectRef,
+    SubtaskList,
     TaskDetail,
     TaskOut,
     TaskPermissions,
@@ -40,7 +41,13 @@ MAX_PAGE_SIZE = 100
 BOARD_LIMIT = 500
 
 _STATUS_ORDER = {s: i for i, s in enumerate(TaskStatus)}
-_EAGER = (selectinload(Task.project), selectinload(Task.assignee), selectinload(Task.reporter))
+_EAGER = (
+    selectinload(Task.project),
+    selectinload(Task.assignee),
+    selectinload(Task.reporter),
+    selectinload(Task.parent),
+    selectinload(Task.labels),
+)
 
 
 class InvalidTransition(AppError):
@@ -67,6 +74,8 @@ def to_out(task: Task, today: date, transitions: list[TaskStatus] | None = None)
         description=task.description,
         reporter=UserBrief.model_validate(task.reporter),
         assignee=UserBrief.model_validate(task.assignee) if task.assignee else None,
+        parent_key=f"{task.project.key}-{task.parent.number}" if task.parent else None,
+        labels=[label.name for label in task.labels],
         start_date=task.start_date,
         due_date=task.due_date,
         completed_at=task.completed_at,
@@ -98,7 +107,22 @@ def permissions(user: User, access: ProjectAccess, task: Task) -> TaskPermission
 def detail(user: User, access: TaskAccess) -> TaskDetail:
     task = access.task
     out = to_out(task, activity.today_for(user), workflow.allowed_transitions(user, access, task))
-    return TaskDetail(**out.model_dump(), permissions=permissions(user, access, task))
+    watchers = [w.user for w in task.watchers]
+    return TaskDetail(
+        **out.model_dump(),
+        permissions=permissions(user, access, task),
+        watchers=[UserBrief.model_validate(u) for u in watchers],
+        watching=any(u.id == user.id for u in watchers),
+    )
+
+
+def watchers_to_notify(db: Session, task: Task) -> list[User]:
+    """Watchers who can still see the task: members of its project, or admins."""
+    return [
+        w.user
+        for w in task.watchers
+        if w.user.is_admin or member_role(db, task.project_id, w.user_id) is not None
+    ]
 
 
 # ---------------------------------------------------------------- helpers
@@ -157,12 +181,17 @@ def task_counts(db: Session, project_ids: list[int], today: date) -> dict[int, T
 # ---------------------------------------------------------------- commands
 
 
-def create_task(db: Session, user: User, access: ProjectAccess, body: CreateTaskRequest) -> TaskDetail:
+def create_task(
+    db: Session, user: User, access: ProjectAccess, body: CreateTaskRequest, parent: Task | None = None
+) -> TaskDetail:
     project = access.project
     ensure_not_archived(project)
     access.require(user, Action.TASK_CREATE)
     if not project.members_can_create_tasks and not access.can(user, Action.TASK_EDIT_ANY):
         raise PermissionDenied("Only project managers can create tasks in this project")
+    # One level only: a subtask cannot have subtasks, so parent/child loops are impossible.
+    if parent is not None and parent.parent_id is not None:
+        raise ValidationFailed("A subtask cannot have its own subtasks", code="nested_subtask")
     assignee = _assignee(db, project, body.assignee_id)
 
     # Atomic counter: concurrent creates can never get the same number (UNIQUE is the backstop).
@@ -188,6 +217,7 @@ def create_task(db: Session, user: User, access: ProjectAccess, body: CreateTask
         assignee=assignee,
         start_date=body.start_date,
         due_date=body.due_date,
+        parent=parent,
     )
     db.add(task)
     db.flush()
@@ -282,7 +312,7 @@ def transition(db: Session, user: User, access: TaskAccess, body: TransitionRequ
     activity.record(db, user, "status_changed", task=task, field="status", old=old, new=body.to_status)
     notify(
         db,
-        [task.assignee, task.reporter],
+        [task.assignee, task.reporter, *watchers_to_notify(db, task)],
         user,
         NotificationType.TASK_STATUS,
         f"{user.full_name} moved {task.key} to {workflow.LABELS[body.to_status]}",
@@ -297,6 +327,8 @@ def delete_task(db: Session, user: User, access: TaskAccess) -> None:
     task = access.task
     ensure_not_archived(access.project)
     access.require(user, Action.TASK_DELETE)
+    if db.scalar(select(func.count()).where(Task.parent_id == task.id)):
+        raise Conflict("Delete this task's subtasks first", code="has_subtasks")
     # Project-level event (task_id None) so the deletion stays in the feed after the task is gone.
     activity.record(db, user, "task_deleted", project=access.project, target=f"{task.key} {task.title}")
     db.delete(task)
@@ -317,6 +349,7 @@ def _filtered(
     assignee: str | None = None,
     q: str | None = None,
     overdue: bool | None = None,
+    label: str | None = None,
 ):
     if status:
         stmt = stmt.where(Task.status.in_(status))
@@ -344,6 +377,8 @@ def _filtered(
             stmt = stmt.where(Task.title.icontains(q, autoescape=True))
     if overdue:
         stmt = stmt.where(Task.due_date < today, Task.status != TaskStatus.DONE)
+    if label:
+        stmt = stmt.where(Task.labels.any(TaskLabel.name == label.strip().lower()))
     return stmt
 
 
@@ -394,6 +429,16 @@ def list_tasks(
         _sorted(stmt, sort, descending).options(*_EAGER).offset((page - 1) * page_size).limit(page_size)
     )
     return Page(items=[to_out(t, today) for t in rows], total=total, page=page, page_size=page_size)
+
+
+def list_subtasks(db: Session, user: User, access: TaskAccess) -> SubtaskList:
+    today = activity.today_for(user)
+    rows = db.scalars(
+        select(Task).where(Task.parent_id == access.task.id).options(*_EAGER).order_by(Task.number)
+    )
+    items = [to_out(t, today) for t in rows]
+    done = sum(1 for t in items if t.status == TaskStatus.DONE)
+    return SubtaskList(items=items, done=done, total=len(items))
 
 
 def board(db: Session, user: User, access: ProjectAccess, **filters) -> Board:

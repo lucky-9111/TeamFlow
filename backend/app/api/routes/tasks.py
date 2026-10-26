@@ -7,8 +7,15 @@ from app.models.enums import TaskPriority, TaskStatus, TaskType
 from app.schemas.common import Page
 from app.schemas.tasks import (
     ActivityOut,
+    BulkResult,
+    BulkUpdateRequest,
     CommentOut,
     CommentRequest,
+    CreateTaskRequest,
+    DependencyRequest,
+    LabelRequest,
+    SubtaskList,
+    TaskDependencies,
     TaskDetail,
     TaskOut,
     TaskSort,
@@ -17,6 +24,7 @@ from app.schemas.tasks import (
 )
 from app.services import comments as comment_service
 from app.services import dashboard as dashboard_service
+from app.services import task_relations
 from app.services import tasks as task_service
 from app.services.access import get_task
 
@@ -34,6 +42,7 @@ def list_tasks(
     assignee: str | None = Query(default=None, description="user id, 'me' or 'none'"),
     q: str | None = Query(default=None, max_length=200),
     overdue: bool | None = None,
+    label: str | None = Query(default=None, max_length=30),
     sort: TaskSort = "updated",
     order: Literal["asc", "desc"] = "desc",
     page: int = Query(default=1, ge=1),
@@ -53,7 +62,13 @@ def list_tasks(
         assignee=assignee,
         q=q,
         overdue=overdue,
+        label=label,
     )
+
+
+@router.post("/tasks/bulk", response_model=BulkResult)
+def bulk_update(body: BulkUpdateRequest, user: CurrentUser, db: DB) -> BulkResult:
+    return task_relations.bulk_update(db, user, body)
 
 
 @router.get("/tasks/{task_key}", response_model=TaskDetail)
@@ -75,6 +90,56 @@ def transition_task(task_key: str, body: TransitionRequest, user: CurrentUser, d
 def delete_task(task_key: str, user: CurrentUser, db: DB) -> Response:
     task_service.delete_task(db, user, get_task(db, user, task_key))
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/tasks/{task_key}/subtasks", response_model=SubtaskList)
+def list_subtasks(task_key: str, user: CurrentUser, db: DB) -> SubtaskList:
+    return task_service.list_subtasks(db, user, get_task(db, user, task_key))
+
+
+@router.post("/tasks/{task_key}/subtasks", response_model=TaskDetail, status_code=status.HTTP_201_CREATED)
+def create_subtask(task_key: str, body: CreateTaskRequest, user: CurrentUser, db: DB) -> TaskDetail:
+    access = get_task(db, user, task_key)
+    return task_service.create_task(db, user, access, body, parent=access.task)
+
+
+@router.get("/tasks/{task_key}/dependencies", response_model=TaskDependencies)
+def list_dependencies(task_key: str, user: CurrentUser, db: DB) -> TaskDependencies:
+    return task_relations.dependencies(db, user, get_task(db, user, task_key))
+
+
+@router.post("/tasks/{task_key}/dependencies", response_model=TaskDependencies)
+def add_dependency(task_key: str, body: DependencyRequest, user: CurrentUser, db: DB) -> TaskDependencies:
+    return task_relations.add_dependency(db, user, get_task(db, user, task_key), body.depends_on)
+
+
+@router.delete("/tasks/{task_key}/dependencies/{depends_on_key}", response_model=TaskDependencies)
+def remove_dependency(task_key: str, depends_on_key: str, user: CurrentUser, db: DB) -> TaskDependencies:
+    return task_relations.remove_dependency(db, user, get_task(db, user, task_key), depends_on_key)
+
+
+@router.post("/tasks/{task_key}/labels", response_model=TaskDetail)
+def add_label(task_key: str, body: LabelRequest, user: CurrentUser, db: DB) -> TaskDetail:
+    access = get_task(db, user, task_key)
+    task_relations.add_label(db, user, access, body.name)
+    return task_service.detail(user, access)
+
+
+@router.delete("/tasks/{task_key}/labels/{name}", response_model=TaskDetail)
+def remove_label(task_key: str, name: str, user: CurrentUser, db: DB) -> TaskDetail:
+    access = get_task(db, user, task_key)
+    task_relations.remove_label(db, user, access, name)
+    return task_service.detail(user, access)
+
+
+@router.post("/tasks/{task_key}/watch", response_model=TaskDetail)
+def watch_task(task_key: str, user: CurrentUser, db: DB) -> TaskDetail:
+    return task_relations.watch(db, user, get_task(db, user, task_key))
+
+
+@router.delete("/tasks/{task_key}/watch", response_model=TaskDetail)
+def unwatch_task(task_key: str, user: CurrentUser, db: DB) -> TaskDetail:
+    return task_relations.unwatch(db, user, get_task(db, user, task_key))
 
 
 @router.get("/tasks/{task_key}/activity", response_model=list[ActivityOut])

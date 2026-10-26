@@ -54,6 +54,7 @@ class NotificationType(StrEnum):
     TASK_STATUS = "task_status"
     TASK_COMMENT = "task_comment"
     PROJECT_ADDED = "project_added"
+    TASK_DUE = "task_due"
 
 
 def str_enum(enum_cls: type[StrEnum], name: str) -> SAEnum:
