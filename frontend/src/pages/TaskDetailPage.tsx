@@ -1,9 +1,10 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { ArrowRight, MessageSquare, Pencil, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { ActivityItem } from "../components/ActivityItem";
 import { StatusBadge, TypeIcon } from "../components/tasks/TaskBits";
+import { Dependencies, Labels, Subtasks, WatchButton } from "../components/tasks/TaskRelations";
 import { Avatar } from "../components/ui/Avatar";
 import { Button } from "../components/ui/Button";
 import { useConfirm } from "../components/ui/Confirm";
@@ -91,29 +92,40 @@ export function TaskDetailPage() {
           </span>
         }
         actions={
-          t.permissions.can_delete && (
-            <Button
-              variant="ghost"
-              size="sm"
-              loading={remove.isPending}
-              onClick={async () => {
-                const ok = await confirm({
-                  title: `Delete ${t.key}?`,
-                  message: "The task, its comments and its history will be removed permanently.",
-                  confirmLabel: "Delete task",
-                  danger: true,
-                });
-                if (ok) remove.mutate();
-              }}
-            >
-              <Trash2 className="h-4 w-4" aria-hidden /> Delete
-            </Button>
-          )
+          <>
+            <WatchButton task={t} />
+            {t.permissions.can_delete && (
+              <Button
+                variant="ghost"
+                size="sm"
+                loading={remove.isPending}
+                onClick={async () => {
+                  const ok = await confirm({
+                    title: `Delete ${t.key}?`,
+                    message: "The task, its comments and its history will be removed permanently.",
+                    confirmLabel: "Delete task",
+                    danger: true,
+                  });
+                  if (ok) remove.mutate();
+                }}
+              >
+                <Trash2 className="h-4 w-4" aria-hidden /> Delete
+              </Button>
+            )}
+          </>
         }
       />
 
       <div className="grid gap-6 lg:grid-cols-3">
         <div className="min-w-0 space-y-6 lg:col-span-2">
+          {t.parent_key && (
+            <p className="-mb-4 text-xs text-gray-500">
+              Subtask of{" "}
+              <Link to={`/tasks/${t.parent_key}`} className="font-medium text-brand-700 hover:underline">
+                {t.parent_key}
+              </Link>
+            </p>
+          )}
           <EditableTitle value={t.title} canEdit={canEdit} onSave={(title) => update.mutateAsync({ title })} />
 
           <div className="flex flex-wrap items-center gap-2">
@@ -131,6 +143,9 @@ export function TaskDetailPage() {
           </div>
 
           <EditableDescription value={t.description} canEdit={canEdit} onSave={(description) => update.mutateAsync({ description })} />
+
+          {!t.parent_key && <Subtasks task={t} />}
+          <Dependencies task={t} />
 
           <section className="card">
             <div className="flex border-b border-gray-100 px-2" role="tablist">
@@ -216,6 +231,9 @@ function Details({ task: t, onChange, saving }: { task: TaskDetail; onChange: (p
             </option>
           ))}
         </select>
+      </Row>
+      <Row label="Labels">
+        <Labels task={t} />
       </Row>
       <Row label="Start date">
         <input aria-label="Start date" type="date" className={select} disabled={!canEdit} value={t.start_date ?? ""} onChange={(e) => onChange({ start_date: e.target.value || null })} />

@@ -6,7 +6,7 @@ export type ProjectStatus = "active" | "on_hold" | "completed";
 export type TaskType = "task" | "bug" | "story";
 export type TaskStatus = "todo" | "in_progress" | "in_review" | "done";
 export type TaskPriority = "low" | "medium" | "high" | "urgent";
-export type NotificationType = "task_assigned" | "task_status" | "task_comment" | "project_added";
+export type NotificationType = "task_assigned" | "task_status" | "task_comment" | "project_added" | "task_due";
 
 export interface CurrentUser {
   id: number;
@@ -16,6 +16,7 @@ export interface CurrentUser {
   workspace_role: WorkspaceRole;
   must_change_password: boolean;
   timezone: string;
+  due_reminders: boolean;
   last_login_at: string | null;
 }
 
@@ -100,6 +101,8 @@ export interface Task {
   description: string;
   reporter: UserBrief;
   assignee: UserBrief | null;
+  parent_key: string | null;
+  labels: string[];
   start_date: string | null;
   due_date: string | null;
   completed_at: string | null;
@@ -112,6 +115,26 @@ export interface Task {
 
 export interface TaskDetail extends Task {
   permissions: { can_edit: boolean; can_assign: boolean; can_delete: boolean; can_comment: boolean };
+  watchers: UserBrief[];
+  watching: boolean;
+}
+
+export interface SubtaskList {
+  items: Task[];
+  done: number;
+  total: number;
+}
+
+export interface TaskDependencies {
+  depends_on: Task[];
+  blocks: Task[];
+  /** Prerequisites that are not Done yet. */
+  unfinished: number;
+}
+
+export interface BulkResult {
+  updated: string[];
+  failed: { key: string; message: string }[];
 }
 
 export interface Page<T> {

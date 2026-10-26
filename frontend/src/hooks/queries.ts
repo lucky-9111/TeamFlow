@@ -10,7 +10,9 @@ import type {
   Project,
   ProjectDetail,
   SearchResults,
+  SubtaskList,
   Task,
+  TaskDependencies,
   TaskDetail,
   TeamMember,
 } from "../types/api";
@@ -23,6 +25,7 @@ export interface TaskFilters {
   assignee?: string;
   q?: string;
   overdue?: boolean;
+  label?: string;
   sort?: string;
   order?: "asc" | "desc";
   page?: number;
@@ -62,6 +65,22 @@ export const useTasks = (filters: TaskFilters) =>
 
 export const useTask = (key: string | undefined) =>
   useQuery({ queryKey: ["task", key], queryFn: () => api.get<TaskDetail>(`/tasks/${key}`), enabled: !!key });
+
+export const useSubtasks = (key: string) =>
+  useQuery({ queryKey: ["task", key, "subtasks"], queryFn: () => api.get<SubtaskList>(`/tasks/${key}/subtasks`) });
+
+export const useDependencies = (key: string) =>
+  useQuery({
+    queryKey: ["task", key, "dependencies"],
+    queryFn: () => api.get<TaskDependencies>(`/tasks/${key}/dependencies`),
+  });
+
+export const useProjectLabels = (key: string | undefined) =>
+  useQuery({
+    queryKey: ["project", key, "labels"],
+    queryFn: () => api.get<string[]>(`/projects/${key}/labels`),
+    enabled: !!key,
+  });
 
 export const useComments = (key: string) =>
   useQuery({ queryKey: ["task", key, "comments"], queryFn: () => api.get<Comment[]>(`/tasks/${key}/comments`) });

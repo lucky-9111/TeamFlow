@@ -38,11 +38,12 @@ function ProfileSection() {
   const { user, setUser } = useAuth();
   const [fullName, setFullName] = useState(user!.full_name);
   const [timezone, setTimezone] = useState(user!.timezone);
+  const [dueReminders, setDueReminders] = useState(user!.due_reminders);
   const [error, setError] = useState<string | null>(null);
   const toast = useToast();
   const qc = useQueryClient();
   const save = useMutation({
-    mutationFn: () => api.patch<CurrentUser>("/auth/me", { full_name: fullName.trim(), timezone }),
+    mutationFn: () => api.patch<CurrentUser>("/auth/me", { full_name: fullName.trim(), timezone, due_reminders: dueReminders }),
     onSuccess: (u) => {
       setUser(u);
       qc.invalidateQueries();
@@ -83,6 +84,20 @@ function ProfileSection() {
             </select>
           )}
         </Field>
+        <label className="flex items-start gap-2 text-sm text-gray-700">
+          <input
+            type="checkbox"
+            className="mt-0.5 h-4 w-4 rounded border-gray-300 text-brand-600"
+            checked={dueReminders}
+            onChange={(e) => setDueReminders(e.target.checked)}
+          />
+          <span>
+            Due-date reminders
+            <span className="block text-xs text-gray-500">
+              A notification when a task you're assigned to or watching is due today or tomorrow.
+            </span>
+          </span>
+        </label>
         <Button type="submit" variant="primary" loading={save.isPending}>
           Save profile
         </Button>

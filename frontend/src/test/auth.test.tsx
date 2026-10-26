@@ -16,6 +16,7 @@ const user = {
   workspace_role: "member",
   must_change_password: false,
   timezone: "UTC",
+  due_reminders: true,
   last_login_at: null,
 };
 

@@ -1,6 +1,7 @@
 import { ArrowDownWideNarrow, ArrowUpNarrowWide, ListChecks, Plus } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
+import { BulkBar } from "../components/tasks/BulkBar";
 import { DueDate, PriorityIcon, StatusBadge, TypeIcon } from "../components/tasks/TaskBits";
 import { CreateTaskDialog } from "../components/tasks/TaskForm";
 import { Avatar } from "../components/ui/Avatar";
@@ -37,12 +38,20 @@ export function TasksPage() {
     assignee: params.get("assignee") ?? undefined,
     q: params.get("q") ?? undefined,
     overdue: params.get("overdue") === "true" || undefined,
+    label: params.get("label") ?? undefined,
     sort: params.get("sort") ?? "updated",
     order: (params.get("order") as "asc" | "desc") ?? (params.get("sort") === "due" ? "asc" : "desc"),
     page: Number(params.get("page") ?? 1),
     page_size: PAGE_SIZE,
   };
   const { data, isPending, isError, error, refetch, isFetching } = useTasks(filters);
+
+  // Selection for bulk actions; it only ever covers the rows on screen, so any filter change resets it.
+  const [selected, setSelected] = useState<string[]>([]);
+  useEffect(() => setSelected([]), [params]);
+  const pageKeys = data?.items.map((t) => t.key) ?? [];
+  const allSelected = pageKeys.length > 0 && pageKeys.every((k) => selected.includes(k));
+  const toggle = (key: string) => setSelected((s) => (s.includes(key) ? s.filter((k) => k !== key) : [...s, key]));
 
   // The search box updates the URL after a pause, so typing doesn't fire a request per key.
   const [q, setQ] = useState(filters.q ?? "");
@@ -68,7 +77,7 @@ export function TasksPage() {
   const statusValue =
     statuses.length === 0 ? "" : statuses.length === 3 && OPEN.every((s) => statuses.includes(s)) ? "open" : statuses[0];
   const onlyMine = filters.assignee === "me";
-  const activeFilters = ["project", "status", "priority", "type", "assignee", "q", "overdue"].some((k) => params.has(k));
+  const activeFilters = ["project", "status", "priority", "type", "assignee", "q", "overdue", "label"].some((k) => params.has(k));
   const pages = data ? Math.max(1, Math.ceil(data.total / PAGE_SIZE)) : 1;
 
   return (
@@ -130,6 +139,7 @@ export function TasksPage() {
             ...(team.data ?? []).map((u) => ({ value: String(u.id), label: u.full_name })),
           ]}
         />
+        <LabelFilter value={filters.label ?? ""} onChange={(v) => update({ label: v || null })} />
         <label className="flex h-9 items-center gap-2 text-sm text-gray-700">
           <input
             type="checkbox"
@@ -164,6 +174,8 @@ export function TasksPage() {
         )}
       </div>
 
+      {selected.length > 0 && <BulkBar keys={selected} onDone={setSelected} />}
+
       <div className={`card overflow-hidden transition-opacity ${isFetching && !isPending ? "opacity-70" : ""}`}>
         {isPending ? (
           <Spinner />
@@ -187,6 +199,15 @@ export function TasksPage() {
             <table className="w-full min-w-[640px]">
               <thead className="border-b border-gray-200 bg-gray-50">
                 <tr>
+                  <th className="table-head w-10">
+                    <input
+                      type="checkbox"
+                      aria-label="Select all tasks on this page"
+                      className="h-4 w-4 rounded border-gray-300 text-brand-600"
+                      checked={allSelected}
+                      onChange={() => setSelected(allSelected ? [] : pageKeys)}
+                    />
+                  </th>
                   <th className="table-head w-24">Key</th>
                   <th className="table-head">Title</th>
                   <th className="table-head hidden lg:table-cell">Project</th>
@@ -199,7 +220,16 @@ export function TasksPage() {
               </thead>
               <tbody className="divide-y divide-gray-100">
                 {data.items.map((t) => (
-                  <tr key={t.id} className="group hover:bg-gray-50">
+                  <tr key={t.id} className={`group hover:bg-gray-50 ${selected.includes(t.key) ? "bg-brand-50/40" : ""}`}>
+                    <td className="px-4 py-2.5">
+                      <input
+                        type="checkbox"
+                        aria-label={`Select ${t.key}`}
+                        className="h-4 w-4 rounded border-gray-300 text-brand-600"
+                        checked={selected.includes(t.key)}
+                        onChange={() => toggle(t.key)}
+                      />
+                    </td>
                     <td className="px-4 py-2.5">
                       <span className="flex items-center gap-2 text-xs font-medium text-gray-500">
                         <TypeIcon type={t.type} />
@@ -210,6 +240,16 @@ export function TasksPage() {
                       <Link to={`/tasks/${t.key}`} className="block truncate font-medium text-gray-900 group-hover:text-brand-700">
                         {t.title}
                       </Link>
+                      {(t.parent_key || t.labels.length > 0) && (
+                        <span className="mt-0.5 flex flex-wrap gap-1 text-xs text-gray-500">
+                          {t.parent_key && <span>Subtask of {t.parent_key}</span>}
+                          {t.labels.map((l) => (
+                            <span key={l} className="rounded bg-gray-100 px-1.5 text-gray-600">
+                              {l}
+                            </span>
+                          ))}
+                        </span>
+                      )}
                     </td>
                     <td className="hidden px-4 py-2.5 text-gray-600 lg:table-cell">{t.project.name}</td>
                     <td className="px-4 py-2.5">
@@ -255,6 +295,29 @@ export function TasksPage() {
 
       <CreateTaskDialog open={createOpen} onClose={() => setCreateOpen(false)} defaultProject={filters.project} />
     </>
+  );
+}
+
+/** Applies on Enter or when the field loses focus, so typing doesn't refetch per key. */
+function LabelFilter({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const [draft, setDraft] = useState(value);
+  useEffect(() => setDraft(value), [value]);
+  return (
+    <div className="w-36">
+      <label className="label" htmlFor="filter-label">
+        Label
+      </label>
+      <input
+        id="filter-label"
+        className="input"
+        placeholder="Any"
+        maxLength={30}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => draft.trim() !== value && onChange(draft.trim())}
+        onKeyDown={(e) => e.key === "Enter" && onChange(draft.trim())}
+      />
+    </div>
   );
 }
 

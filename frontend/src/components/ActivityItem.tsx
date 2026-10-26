@@ -22,6 +22,14 @@ function describe(e: ActivityEvent): string {
       return e.field === "description" ? "updated the description of" : `changed ${field} from ${from} to ${to} on`;
     case "comment_added":
       return "commented on";
+    case "dependency_added":
+      return `made it depend on ${e.new_value}:`;
+    case "dependency_removed":
+      return `removed the dependency on ${e.old_value} from`;
+    case "label_added":
+      return `added label "${e.new_value}" to`;
+    case "label_removed":
+      return `removed label "${e.old_value}" from`;
     case "project_created":
       return "created project";
     case "project_updated":

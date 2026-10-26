@@ -49,6 +49,8 @@ export const FIELD_LABEL: Record<string, string> = {
   end_date: "end date",
   members_can_create_tasks: "task creation setting",
   workspace_role: "workspace role",
+  depends_on: "dependency",
+  label: "label",
 };
 
 export function valueLabel(field: string | null, value: string | null): string {
