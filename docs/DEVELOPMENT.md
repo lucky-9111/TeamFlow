@@ -64,8 +64,17 @@ ruff format --check .
 ### Maintenance commands
 
 ```bash
-python -m app.cli cleanup      # prune expired sessions and old login attempts
+python -m app.cli cleanup                 # prune expired sessions and old login attempts
+python -m app.cli send-due-reminders      # notify about open tasks due today or tomorrow
+python -m app.cli send-due-reminders --days-ahead 3
 ```
+
+**Due-date reminders** are not started by the API (several API workers would otherwise send
+duplicates). Schedule the command once a day: cron on Linux (`0 8 * * * cd /srv/teamflow/backend &&
+.venv/bin/python -m app.cli send-due-reminders`) or Windows Task Scheduler. Re-running it is safe:
+each (task, due date) is reminded once, recorded in `task_reminders`. Changing a due date makes the
+task eligible again. Users can turn reminders off in Settings. If a run fails, the next run picks up
+anything still due; the command prints how many tasks it reminded.
 
 ## Frontend
 

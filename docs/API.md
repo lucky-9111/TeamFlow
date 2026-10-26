@@ -17,8 +17,8 @@ Base path: `/api/v1`. Interactive docs with request/response schemas: http://127
   | 401 | Not signed in / session expired | `not_authenticated`, `session_expired`, `invalid_credentials` |
   | 403 | Signed in, but not allowed | `forbidden`, `csrf_failed`, `password_change_required` |
   | 404 | Doesn't exist **or you can't see it** (non-members get 404, not 403) | `not_found` |
-  | 409 | Conflicts with the current state | `stale_version`, `project_archived`, `last_admin`, `last_manager`, `project_key_taken` |
-  | 422 | Invalid input | `validation_error`, `invalid_assignee` |
+  | 409 | Conflicts with the current state | `stale_version`, `project_archived`, `last_admin`, `last_manager`, `project_key_taken`, `has_subtasks` |
+  | 422 | Invalid input | `validation_error`, `invalid_assignee`, `nested_subtask`, `invalid_dependency`, `dependency_cycle`, `too_many_labels` |
   | 429 | Too many failed logins | `too_many_requests` |
 
 - **Lists** that can grow return `{items, total, page, page_size}`; `page_size` is capped at 100.
@@ -33,7 +33,7 @@ Base path: `/api/v1`. Interactive docs with request/response schemas: http://127
 | POST | `/auth/login` | `{email, password}` → `{user, csrf_token}` and cookies |
 | POST | `/auth/logout` | Revokes the session |
 | GET | `/auth/me` | Current user |
-| PATCH | `/auth/me` | `{full_name?, timezone?}` |
+| PATCH | `/auth/me` | `{full_name?, timezone?, due_reminders?}` |
 | POST | `/auth/change-password` | `{current_password, new_password}`; signs out other devices |
 | GET | `/auth/csrf` | New CSRF token for the current session |
 
@@ -66,6 +66,7 @@ Base path: `/api/v1`. Interactive docs with request/response schemas: http://127
 | PATCH | `/projects/{key}/members/{user_id}` | manager/admin | `{role}`; a project keeps at least one manager |
 | DELETE | `/projects/{key}/members/{user_id}` | manager/admin | Their open tasks become unassigned |
 | GET | `/projects/{key}/board?assignee=&q=&priority=&type=` | members | Tasks grouped by status, each with `allowed_transitions` for you |
+| GET | `/projects/{key}/labels` | members | Labels already used in the project (for suggestions) |
 | POST | `/projects/{key}/tasks` | members (see project setting) | `{title, description?, type?, priority?, assignee_id?, start_date?, due_date?}` |
 
 ## Tasks
@@ -74,12 +75,21 @@ Base path: `/api/v1`. Interactive docs with request/response schemas: http://127
 
 | Method | Path | Notes |
 |--------|------|-------|
-| GET | `/tasks` | Filters: `project`, `status` (repeatable), `priority`, `type`, `assignee` (`me`, `none` or a user id), `q` (title or key), `overdue`; `sort` = `updated`/`created`/`due`/`priority`/`status`/`key`, `order` = `asc`/`desc`, `page`, `page_size` |
+| GET | `/tasks` | Filters: `project`, `status` (repeatable), `priority`, `type`, `assignee` (`me`, `none` or a user id), `q` (title or key), `overdue`, `label`; `sort` = `updated`/`created`/`due`/`priority`/`status`/`key`, `order` = `asc`/`desc`, `page`, `page_size` |
 | GET | `/tasks/{task_key}` | Detail with `allowed_transitions` and `permissions` |
 | PATCH | `/tasks/{task_key}` | `{version, title?, description?, type?, priority?, assignee_id?, start_date?, due_date?}`. Cannot change status. |
 | POST | `/tasks/{task_key}/transitions` | `{to_status, version}`. See the workflow in the README. |
-| DELETE | `/tasks/{task_key}` | Managers/admins |
+| DELETE | `/tasks/{task_key}` | Managers/admins. `409 has_subtasks` while it still has subtasks: delete those first. |
 | GET | `/tasks/{task_key}/activity` | History of this task |
+| GET | `/tasks/{task_key}/subtasks` | `{items, done, total}`, e.g. "3 of 5 done" |
+| POST | `/tasks/{task_key}/subtasks` | Same body and rules as creating a task. One level only: a subtask can't have subtasks (`422 nested_subtask`). |
+| GET | `/tasks/{task_key}/dependencies` | `{depends_on, blocks, unfinished}`. `unfinished` counts prerequisites not Done. |
+| POST | `/tasks/{task_key}/dependencies` | `{depends_on: "TF-3"}`. Editors of the task. Same project only; self-links and cycles are rejected. Status changes are **not** blocked by unfinished prerequisites; the UI shows a warning. |
+| DELETE | `/tasks/{task_key}/dependencies/{other_key}` | Editors of the task |
+| POST | `/tasks/{task_key}/labels` | `{name}`. Editors. Stored lower-case, 1-30 chars (letters, numbers, space, `-`, `_`), max 10 per task; adding an existing label does nothing. |
+| DELETE | `/tasks/{task_key}/labels/{name}` | Editors |
+| POST · DELETE | `/tasks/{task_key}/watch` | Watch / stop watching (yourself). Anyone who can see the task. |
+| POST | `/tasks/bulk` | `{task_keys: [...], <one of> assignee_id | priority | status | add_label}`, max 100 keys. Each task goes through the normal rules and is saved separately. Answer: `{updated: [keys], failed: [{key, message}]}`, so partial success is reported, never hidden. |
 | GET | `/tasks/{task_key}/comments` | |
 | POST | `/tasks/{task_key}/comments` | `{body}` |
 | PATCH | `/comments/{id}` | Author, or a project manager |
@@ -98,4 +108,6 @@ Base path: `/api/v1`. Interactive docs with request/response schemas: http://127
 | GET | `/health` | No auth. `{"status": "ok"}` |
 
 Notifications are created when someone else assigns you a task, moves or comments on a task you
-reported or are assigned to, or adds you to a project.
+reported, are assigned to or **watch**, or adds you to a project. Watchers who are no longer project
+members get nothing. Due-date reminders (`task_due`) come from the daily `send-due-reminders` job
+(see DEVELOPMENT.md) and respect each user's `due_reminders` setting.

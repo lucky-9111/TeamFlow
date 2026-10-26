@@ -11,6 +11,12 @@ Built and tested: auth, team management, workspace settings, projects + members 
 dashboard, search, and the React frontend (Overview, My Tasks/task list, Projects, Board with
 drag-and-drop, Task detail, Team, Activity, Settings). See [API.md](API.md) for the endpoints that exist.
 
+**Next phase, Phase 1 (2026-10-26):** subtasks (`tasks.parent_id`, one level), task dependencies
+(`task_dependencies`), labels (`task_labels`), watchers (`task_watchers`), bulk updates
+(`POST /tasks/bulk`) and due-date reminders (`task_reminders` + `python -m app.cli send-due-reminders`).
+The rows below about hierarchy, links, labels and reminders describe v1 and are superseded by this.
+See [AUDIT.md](AUDIT.md) for the feature matrix and the Phase 1 report.
+
 Deliberate differences from the original plan below, to keep v1 small for a 2–10 person team:
 
 | Plan | What was built | Why |
